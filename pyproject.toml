@@ -176,7 +176,7 @@ dev = [
     # importable, which silently hides regressions — install no-deps
     # in the dev environment so the test actually runs.
     "xgrammar==0.2.3",
-    "apache-tvm-ffi==0.1.11",
+    "apache-tvm-ffi==0.1.12",
 ]
 # PEP 735 dependency groups — consumed by `uv sync --dev`.
 # Keep in sync with [project.optional-dependencies] dev above
@@ -191,7 +191,7 @@ dev = [
     "mcp>=1.5.0",
     "venvstacks>=0.7.0",
     "xgrammar==0.2.3",
-    "apache-tvm-ffi==0.1.11",
+    "apache-tvm-ffi==0.1.12",
 ]
 
 [project.urls]
