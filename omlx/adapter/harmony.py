@@ -505,10 +505,21 @@ def parse_tool_calls_from_tokens(
 
             elif msg.channel == "analysis":
                 # Extract chain-of-thought text from analysis channel
-                for content in msg_content:
-                    text = getattr(content, "text", None)
-                    if isinstance(text, str):
-                        analysis_text += text
+                # BUT also check if this is a tool call routed to the wrong channel
+                if _is_commentary_tool_call_message(msg):
+                    # Tool call in analysis channel — extract as tool call
+                    name = msg.recipient[10:]  # Remove "functions." prefix
+                    arguments = ""
+                    for content in msg_content:
+                        text = getattr(content, "text", None)
+                        if isinstance(text, str):
+                            arguments += text
+                    tool_calls.append({"name": name, "arguments": arguments})
+                else:
+                    for content in msg_content:
+                        text = getattr(content, "text", None)
+                        if isinstance(text, str):
+                            analysis_text += text
 
             elif msg.channel != "commentary" and _has_no_real_recipient(msg.recipient):
                 # Preserve malformed/unknown assistant channels as visible text
