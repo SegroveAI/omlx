@@ -3610,8 +3610,13 @@ async def create_chat_completion(
                     ChatCompletionChoice(
                         message=AssistantMessage(
                             content=cleaned_text.strip() if cleaned_text else None,
+                            # Only include reasoning_content when there are no tool calls.
+                            # Non-standard fields alongside tool_calls can confuse some
+                            # OpenAI SDK clients (e.g. C# Microsoft.Extensions.AI.OpenAI).
                             reasoning_content=(
-                                cleaned_thinking if cleaned_thinking else None
+                                cleaned_thinking
+                                if cleaned_thinking and not tool_calls
+                                else None
                             ),
                             tool_calls=tool_calls,
                         ),
