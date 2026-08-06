@@ -57,6 +57,116 @@ class TestCacheRollback:
         cache = ArraysCache(size=2)
         assert cache.rollback_state is None
 
+    def test_full_accept_clears_pooling_undo_chain(self):
+        from omlx.patches.mlx_lm_mtp.batch_generator import _clear_rollback
+
+        pool = SimpleNamespace(_undo=object(), _undo_chain=True)
+        container = SimpleNamespace(caches=[SimpleNamespace(caches=[pool])])
+
+        _clear_rollback([container])
+
+        assert pool._undo is None
+        assert pool._undo_chain is False
+
+
+class TestMtpBoundaryCommit:
+    @staticmethod
+    def _run_full_accept_cycle(monkeypatch, *, emitted, drafts, clamp=None):
+        import mlx.core as mx
+
+        from omlx.patches.mlx_lm_mtp import batch_generator as bg
+
+        cache = SimpleNamespace(offset=emitted - 1)
+        model = SimpleNamespace(_omlx_mtp_commit_align=4)
+        if clamp is not None:
+            model.mtp_clamp_accept = lambda _cache, accepted, _drafts: min(
+                accepted, clamp
+            )
+
+        draft_ids = list(range(1, drafts + 1))
+        state = bg._MtpState(
+            uid=1,
+            chain=True,
+            depth=drafts,
+            mtp_cache=[],
+            next_main=mx.array([15], dtype=mx.uint32),
+            drafts=mx.array(draft_ids, dtype=mx.uint32),
+            draft_lps=[mx.zeros((32,)) for _ in draft_ids],
+        )
+
+        def logits_for(targets):
+            rows = []
+            for target in targets:
+                row = [-100.0] * 32
+                row[target] = 0.0
+                rows.append(row)
+            return mx.array([rows], dtype=mx.float32)
+
+        def fake_backbone(_model, inputs, _cache, **_kwargs):
+            width = int(inputs.shape[1])
+            cache.offset += width
+            targets = draft_ids + [20] if width > 1 else [21]
+            return (
+                logits_for(targets),
+                mx.zeros((1, width, 8), dtype=mx.float32),
+                None,
+            )
+
+        def fake_rollback(_model, _cache, accepted, num_drafts, _gdn_states):
+            cache.offset -= num_drafts - accepted
+            return True
+
+        def greedy(logprobs):
+            return mx.argmax(logprobs, axis=-1).astype(mx.uint32)
+
+        batch = SimpleNamespace(
+            model=model,
+            prompt_cache=[cache],
+            tokens=[list(range(emitted))],
+            samplers=[None],
+            fallback_sampler=greedy,
+            logits_processors=[],
+            _token_context=[],
+        )
+
+        monkeypatch.setattr(bg, "_call_backbone", fake_backbone)
+        monkeypatch.setattr(bg, "_chain_rollback", fake_rollback)
+        monkeypatch.setattr(bg, "_chain_next_drafts", lambda *args, **kwargs: None)
+        monkeypatch.setattr(bg, "_clear_rollback", lambda _cache: None)
+
+        bg._run_verify_cycle_chain(batch, state)
+        return batch, state, cache
+
+    @pytest.mark.parametrize(
+        ("drafts", "clamp", "boundary_source"),
+        [
+            (1, None, "bonus"),
+            (2, None, "draft"),
+            (3, 1, "verify"),
+            (4, None, "draft"),
+        ],
+    )
+    def test_boundary_emit_matches_backbone_offset(
+        self, monkeypatch, drafts, clamp, boundary_source
+    ):
+        batch, state, cache = self._run_full_accept_cycle(
+            monkeypatch,
+            emitted=2,
+            drafts=drafts,
+            clamp=clamp,
+        )
+
+        distance = 4 - len(batch.tokens[0])
+        emitted_sources = []
+        for _ in range(distance):
+            token_id, _logprobs, source = state.queue.popleft()
+            batch.tokens[0].append(token_id)
+            emitted_sources.append(source)
+
+        assert emitted_sources[-1] == boundary_source
+        assert len(batch.tokens[0]) == 4
+        assert cache.offset == 4
+
 
 class TestQwen35Model:
     @pytest.fixture(autouse=True)
@@ -989,9 +1099,11 @@ class TestBatchGeneratorDispatch:
 
         assert batch_generator._generation_batch_has_active_mtp(_EmptyBatch()) is False
 
-    def test_rowwise_batch_eligibility_requires_safe_activation(self):
+    def test_rowwise_batch_eligibility_requires_safe_activation(self, monkeypatch):
         from omlx.patches.mlx_lm_mtp import is_mtp_active, set_mtp_active
         from omlx.patches.mlx_lm_mtp import batch_generator
+
+        monkeypatch.setenv(batch_generator._ROWWISE_BATCH_MTP_ENV, "1")
 
         class _MtpModel:
             def __init__(self):
@@ -1023,9 +1135,51 @@ class TestBatchGeneratorDispatch:
         finally:
             set_mtp_active(prior_active)
 
-    def test_rowwise_batch_new_activation_requires_aligned_offsets(self):
+    def test_rowwise_batch_new_activation_is_opt_in(self, monkeypatch):
+        # Default (env unset): no NEW row-wise activation — standard batched
+        # decode measured faster at batch >= 2. Existing batch state still
+        # continues so a mid-flight batch is not torn down by a config flip.
         from omlx.patches.mlx_lm_mtp import is_mtp_active, set_mtp_active
         from omlx.patches.mlx_lm_mtp import batch_generator
+
+        monkeypatch.delenv(batch_generator._ROWWISE_BATCH_MTP_ENV, raising=False)
+
+        class _MtpModel:
+            def __init__(self):
+                self.mtp = object()
+                self._omlx_mtp_decode_enabled = True
+
+            def mtp_forward(self, *_):
+                pass
+
+        prior_active = is_mtp_active()
+        try:
+            set_mtp_active(True)
+            batch = SimpleNamespace(
+                model=_MtpModel(),
+                uids=[1, 2],
+                logits_processors=[],
+                _omlx_mtp_activation_safe=True,
+                prompt_cache=[],
+            )
+            assert batch_generator._is_mtp_batch_eligible(batch) is False
+
+            batch._omlx_mtp_batch_state = batch_generator._MtpBatchState(
+                states={1: batch_generator._MtpState(uid=1)}
+            )
+            assert batch_generator._is_mtp_batch_eligible(batch) is True
+        finally:
+            set_mtp_active(prior_active)
+
+    def test_rowwise_batch_new_activation_allows_ragged_offsets(self, monkeypatch):
+        # Continuous batching admits rows at different times, so per-row
+        # cache offsets rarely align. Activation must not require alignment:
+        # each row is seeded from its own extract_cache view and steady-state
+        # row cycles diverge the offsets anyway (#2150).
+        from omlx.patches.mlx_lm_mtp import is_mtp_active, set_mtp_active
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        monkeypatch.setenv(batch_generator._ROWWISE_BATCH_MTP_ENV, "1")
 
         class _Offset:
             def __init__(self, values):
@@ -1052,12 +1206,133 @@ class TestBatchGeneratorDispatch:
                 _omlx_mtp_activation_safe=True,
                 prompt_cache=[SimpleNamespace(offset=_Offset([8, 5]))],
             )
-            assert batch_generator._is_mtp_batch_eligible(batch) is False
-
-            batch.prompt_cache = [SimpleNamespace(offset=_Offset([8, 8]))]
             assert batch_generator._is_mtp_batch_eligible(batch) is True
         finally:
             set_mtp_active(prior_active)
+
+    def test_rowwise_batch_activation_allowed_after_standard_multirow_decode(
+        self, monkeypatch
+    ):
+        # The multirow-decode marker protects singleton re-initialization
+        # only. A batch's first decode step is always standard (MTP has not
+        # activated yet), so blocking batch activation on the marker would
+        # permanently lock every batch out of row-wise MTP (#2150).
+        from omlx.patches.mlx_lm_mtp import is_mtp_active, set_mtp_active
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        monkeypatch.setenv(batch_generator._ROWWISE_BATCH_MTP_ENV, "1")
+
+        class _MtpModel:
+            def __init__(self):
+                self.mtp = object()
+                self._omlx_mtp_decode_enabled = True
+
+            def mtp_forward(self, *_):
+                pass
+
+        prior_active = is_mtp_active()
+        try:
+            set_mtp_active(True)
+            batch = SimpleNamespace(
+                model=_MtpModel(),
+                uids=[1, 2],
+                logits_processors=[],
+                _omlx_mtp_activation_safe=True,
+                _omlx_mtp_saw_standard_multirow_decode=True,
+                prompt_cache=[],
+            )
+            assert batch_generator._is_mtp_batch_eligible(batch) is True
+
+            singleton = SimpleNamespace(
+                model=_MtpModel(),
+                uids=[1],
+                logits_processors=[],
+                _omlx_mtp_activation_safe=True,
+                _omlx_mtp_saw_standard_multirow_decode=True,
+            )
+            assert batch_generator._is_mtp_eligible(singleton) is False
+        finally:
+            set_mtp_active(prior_active)
+
+    def test_singleton_recovery_clears_marker_when_cache_compact(self):
+        # A batch that shrinks back to one row with no residual left padding
+        # satisfies the singleton-init invariant again, so the multirow
+        # marker must lift and the surviving request regains MTP (#2150).
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        class _Padding:
+            def __init__(self, values):
+                self._values = values
+
+            def tolist(self):
+                return list(self._values)
+
+        batch = SimpleNamespace(
+            uids=[1],
+            _omlx_mtp_saw_standard_multirow_decode=True,
+            prompt_cache=[SimpleNamespace(left_padding=_Padding([0]))],
+        )
+        batch_generator._maybe_clear_multirow_marker(batch)
+        assert batch._omlx_mtp_saw_standard_multirow_decode is False
+
+        # Residual padding: the invariant does not hold — keep the marker.
+        padded = SimpleNamespace(
+            uids=[1],
+            _omlx_mtp_saw_standard_multirow_decode=True,
+            prompt_cache=[SimpleNamespace(left_padding=_Padding([3]))],
+        )
+        batch_generator._maybe_clear_multirow_marker(padded)
+        assert padded._omlx_mtp_saw_standard_multirow_decode is True
+
+        # Still multi-row: never clears.
+        multirow = SimpleNamespace(
+            uids=[1, 2],
+            _omlx_mtp_saw_standard_multirow_decode=True,
+            prompt_cache=[SimpleNamespace(left_padding=_Padding([0, 0]))],
+        )
+        batch_generator._maybe_clear_multirow_marker(multirow)
+        assert multirow._omlx_mtp_saw_standard_multirow_decode is True
+
+    def test_singleton_recovery_checks_cachelist_sub_caches(self):
+        # CacheList layers (GLM 5.2 / DeepSeek v3.2 lineage) keep left
+        # padding on their sub-caches, not on the container. The compactness
+        # check must recurse into ``.caches`` instead of skipping the layer,
+        # or the marker clears without verifying anything.
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        class _Padding:
+            def __init__(self, values):
+                self._values = values
+
+            def tolist(self):
+                return list(self._values)
+
+        class _CacheList:
+            def __init__(self, *caches):
+                self.caches = caches
+
+        padded = SimpleNamespace(
+            uids=[1],
+            _omlx_mtp_saw_standard_multirow_decode=True,
+            prompt_cache=[
+                _CacheList(SimpleNamespace(left_padding=_Padding([3])))
+            ],
+        )
+        batch_generator._maybe_clear_multirow_marker(padded)
+        assert padded._omlx_mtp_saw_standard_multirow_decode is True
+
+        compact = SimpleNamespace(
+            uids=[1],
+            _omlx_mtp_saw_standard_multirow_decode=True,
+            prompt_cache=[
+                _CacheList(
+                    SimpleNamespace(left_padding=_Padding([0])),
+                    SimpleNamespace(left_padding=_Padding([0])),
+                )
+            ],
+        )
+        batch_generator._maybe_clear_multirow_marker(compact)
+        assert compact._omlx_mtp_saw_standard_multirow_decode is False
 
     def test_mtp_state_valid_requires_single_matching_uid(self):
         from omlx.patches.mlx_lm_mtp.batch_generator import (
@@ -1325,6 +1600,17 @@ class TestMtpCompatibilityHelpers:
 
     def test_has_mtp_heads_nextn_field(self):
         assert _has_mtp_heads({"num_nextn_predict_layers": 2}) is True
+
+    def test_has_mtp_heads_dspark_fields(self):
+        assert (
+            _has_mtp_heads(
+                {
+                    "dspark_block_size": 5,
+                    "dspark_target_layer_ids": [40, 41, 42],
+                }
+            )
+            is True
+        )
 
     def test_has_mtp_heads_text_config_field(self):
         assert _has_mtp_heads({"text_config": {"mtp_num_hidden_layers": 1}}) is True
@@ -1845,3 +2131,55 @@ class TestRotatingCacheMtpUndo:
         assert cache.is_trimmable()
         assert cache.trim(1) == 1
         assert cache.offset == 3
+
+
+class TestParkedScopePerSequence:
+    """The depth-0 hand-off must park exactly one sequence, not the batch.
+
+    GenerationBatch objects are reused across requests through extend()
+    merges, so the parked marker is keyed by uid: it blocks re-activation
+    only while that uid is still in the batch, and a later request that
+    inherits the same batch object gets MTP normally.
+    """
+
+    def _fake_batch(self, uids):
+        model = SimpleNamespace(
+            mtp_forward=lambda *a, **k: None,
+            mtp=object(),
+            _omlx_mtp_decode_enabled=True,
+        )
+        return SimpleNamespace(
+            model=model,
+            uids=list(uids),
+            logits_processors=None,
+        )
+
+    def test_parked_uid_blocks_only_that_sequence(self):
+        from omlx.patches.mlx_lm_mtp.batch_generator import _mtp_common_eligible
+
+        gb = self._fake_batch([7])
+        assert _mtp_common_eligible(gb)
+        gb._omlx_mtp_parked_uid = 7
+        assert not _mtp_common_eligible(gb)
+        # The parked request finished; a new request reuses the batch object.
+        gb.uids = [8]
+        assert _mtp_common_eligible(gb)
+
+    def test_tax_probe_discarded_when_batch_gains_rows(self):
+        from omlx.patches.mlx_lm_mtp.batch_generator import (
+            _STD_TAX_SKIP,
+            _arm_std_tax_probe,
+            _record_std_tax_sample,
+        )
+
+        gb = self._fake_batch([7])
+        _arm_std_tax_probe(gb, 12.0, uid=7)
+        for _ in range(_STD_TAX_SKIP + 2):
+            _record_std_tax_sample(gb, 10.0)
+        assert hasattr(gb, "_omlx_mtp_tax_probe")
+        # Another request merges in mid-probe: multi-row step timings must
+        # not contaminate the singleton loop-tax ratio.
+        gb.uids = [7, 9]
+        _record_std_tax_sample(gb, 10.0)
+        assert not hasattr(gb, "_omlx_mtp_tax_probe")
+        assert not hasattr(gb.model, "_omlx_mtp_loop_tax")

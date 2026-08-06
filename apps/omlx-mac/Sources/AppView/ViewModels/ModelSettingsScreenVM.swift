@@ -58,19 +58,19 @@ final class ModelSettingsScreenVM {
             ("vlm", String(localized: "settings.model_type.vlm",
                            defaultValue: "VLM",
                            comment: "Model type option label for vision-language models")),
-            ("embed", String(localized: "settings.model_type.embed",
-                             defaultValue: "Embedding",
-                             comment: "Model type option label for embedding models")),
-            ("rerank", String(localized: "settings.model_type.rerank",
-                              defaultValue: "Reranker",
-                              comment: "Model type option label for reranker models")),
-            ("audio-stt", String(localized: "settings.model_type.audio_stt",
+            ("embedding", String(localized: "settings.model_type.embed",
+                                 defaultValue: "Embedding",
+                                 comment: "Model type option label for embedding models")),
+            ("reranker", String(localized: "settings.model_type.rerank",
+                                defaultValue: "Reranker",
+                                comment: "Model type option label for reranker models")),
+            ("audio_stt", String(localized: "settings.model_type.audio_stt",
                                  defaultValue: "Audio STT",
                                  comment: "Model type option label for speech-to-text models")),
-            ("audio-tts", String(localized: "settings.model_type.audio_tts",
+            ("audio_tts", String(localized: "settings.model_type.audio_tts",
                                  defaultValue: "Audio TTS",
                                  comment: "Model type option label for text-to-speech models")),
-            ("audio-sts", String(localized: "settings.model_type.audio_sts",
+            ("audio_sts", String(localized: "settings.model_type.audio_sts",
                                  defaultValue: "Audio STS",
                                  comment: "Model type option label for speech-to-speech models")),
         ]
@@ -784,7 +784,31 @@ final class ModelSettingsScreenVM {
                           defaultValue: "Disable TurboQuant KV before enabling VLM MTP.",
                           comment: "Tooltip / sublabel shown when VLM MTP can't be enabled because TurboQuant KV is on")
         }
+        if vlmMtpProcessorConflict {
+            return String(localized: "settings.vlm_mtp.conflict.processors",
+                          defaultValue: "Unset repetition / presence penalty before enabling VLM MTP.",
+                          comment: "Tooltip / sublabel shown when VLM MTP can't be enabled because penalty settings are set")
+        }
         return nil
+    }
+
+    /// Settings that materialize as per-request logits processors, which the
+    /// vlm_mtp decode path cannot apply (#2399). Mirrors
+    /// vlm_mtp_processor_conflicts() in model_settings.py; neutral values
+    /// (repetition 1.0, presence 0.0) do not conflict. Thinking budget is
+    /// exempt: it is applied on the vlm_mtp path at verify time
+    /// (MTPProcessingSampler).
+    var vlmMtpProcessorConflict: Bool {
+        if let rep = Double(repetitionPenalty), rep != 1.0 { return true }
+        if let pres = Double(presencePenalty), pres != 0.0 { return true }
+        return false
+    }
+
+    /// Sublabel / tooltip for the sampling rows locked while VLM MTP is on.
+    var vlmMtpProcessorLockedReason: String {
+        String(localized: "settings.sampling.locked.vlm_mtp",
+               defaultValue: "Disable VLM MTP to edit this setting.",
+               comment: "Tooltip / sublabel shown when a penalty or thinking-budget row is locked because VLM MTP is on")
     }
 
     // MARK: - Working profile dict assembly

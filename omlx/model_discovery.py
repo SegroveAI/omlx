@@ -57,6 +57,7 @@ VLM_MODEL_TYPES = {
     "florence2",
     "deepseekocr",
     "deepseekocr_2",
+    "unlimited_ocr",
     "dots_ocr",
     "glm_ocr",
     "minimax_m3_vl",
@@ -64,6 +65,8 @@ VLM_MODEL_TYPES = {
     "phi4_siglip",
     "phi4mm",
     "youtu_vl",
+    "inkling",
+    "inkling_mm_model",  # config model_type of Inkling Small checkpoints
 }
 
 # Text-only model families that are implemented in mlx-vlm rather than
@@ -72,6 +75,14 @@ VLM_MODEL_TYPES = {
 VLM_NATIVE_TEXT_MODEL_TYPES = {
     "cohere2_moe",
     "minimax_m3",
+}
+
+# Multimodal checkpoints whose currently vendored mlx-lm implementation only
+# exposes the text backbone. Route them directly to BatchedEngine instead of
+# deliberately failing an mlx-vlm load and relying on the engine-pool fallback.
+# Remove a family once mlx-vlm provides its multimodal implementation.
+MLX_LM_TEXT_ONLY_MODEL_TYPES = {
+    "mimo_v2",
 }
 
 # Speculative-decoding "helper" checkpoints (dFlash / MTP / assistant drafters)
@@ -147,6 +158,8 @@ VLM_ARCHITECTURES = {
     "Molmo2ForConditionalGeneration",
     "LlavaQwen2ForCausalLM",  # apple/FastVLM (all sizes)
     "Florence2ForConditionalGeneration",
+    "UnlimitedOCRForCausalLM",  # baidu/Unlimited-OCR
+    "InklingForConditionalGeneration",  # thinkingmachines/Inkling-Small
 }
 
 # Known embedding model types from mlx-embeddings
@@ -345,6 +358,7 @@ class DiscoveredModel:
     model_type: ModelType  # "llm", "vlm", "embedding", or "reranker"
     engine_type: EngineType  # "batched", "vlm", "embedding", or "reranker"
     estimated_size: int  # Estimated memory usage in bytes
+    text_only_size: int = 0  # Language-only estimate for VLM checkpoints (0 = n/a)
     config_model_type: str = ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
     thinking_default: bool | None = None  # True if model thinks by default, False if not, None if unknown
     preserve_thinking_default: bool | None = None  # True when template supports preserve_thinking (Qwen 3.6+)
@@ -526,16 +540,19 @@ def _has_vision_subconfig(config: dict) -> bool:
     - ``vision_config`` — most VLMs (Qwen2-VL, Gemma3, LLaVA-Next, ...).
     - ``vit_config`` — Molmo / Molmo2 family.
     - ``mm_vision_tower`` — older LLaVA family including FastVLM's
-      ``llava_qwen2``. The check is non-empty-only: a config-stub text-only
-      quant could in principle declare a tower path it doesn't ship weights
-      for, but in practice bf16 FastVLM ships a real path string.
+      ``llava_qwen2``.
+
+    All three are non-empty checks: text-only quants of VLM families can
+    leave an empty ``vision_config: {}`` stub behind after stripping the
+    vision tower (#2385), and key presence alone would misclassify them
+    as VLM.
 
     Used by the VLM classifier in :func:`detect_model_type` and by other
     paths (``oq``, admin model info) that need to ask "is this a VLM?".
     """
     return (
-        "vision_config" in config
-        or "vit_config" in config
+        bool(config.get("vision_config"))
+        or bool(config.get("vit_config"))
         or bool(config.get("mm_vision_tower"))
     )
 
@@ -642,6 +659,15 @@ def detect_model_type(model_path: Path) -> ModelType:
             "— treating as LLM"
         )
 
+    if normalized_type in MLX_LM_TEXT_ONLY_MODEL_TYPES:
+        if _has_vision_subconfig(config):
+            logger.warning(
+                "%s carries multimodal configuration, but the available mlx-lm "
+                "implementation is text-only; using the LLM engine",
+                model_type,
+            )
+        return "llm"
+
     if normalized_type in VLM_NATIVE_TEXT_MODEL_TYPES:
         logger.info(
             f"{model_type} detected as mlx-vlm native text model"
@@ -735,13 +761,15 @@ def detect_model_type(model_path: Path) -> ModelType:
 
 
 def detect_thinking_default(model_path: Path) -> bool | None:
-    """Detect whether a model's chat template enables thinking by default.
+    """Detect a model's effective thinking default from local metadata.
 
     Inspects the Jinja chat template for ``enable_thinking`` references and
-    determines the default behaviour:
+    determines the default behaviour, including narrow model-family serving
+    recommendations when the raw template deliberately defaults to opt-in:
 
     * **True** — model thinks by default (e.g. Qwen 3.x: only suppresses
-      thinking when ``enable_thinking is false``).
+      thinking when ``enable_thinking is false``; Laguna: Poolside recommends
+      servers pass ``enable_thinking=true`` by default).
     * **False** — model suppresses thinking by default (e.g. Gemma 4: only
       enables thinking when ``enable_thinking`` is truthy,
       ``default(false)``).
@@ -768,12 +796,30 @@ def detect_thinking_default(model_path: Path) -> bool | None:
     if not template_text or "enable_thinking" not in template_text:
         return None
 
+    # Laguna's Jinja initializes the flag to false for direct tokenizer calls,
+    # while Poolside's serving recipe explicitly sets the default to true. Keep
+    # discovery, the admin "Auto" toggle, and API request policy consistent.
+    try:
+        with (model_path / "config.json").open(encoding="utf-8") as config_file:
+            model_config = json.load(config_file)
+    except (OSError, json.JSONDecodeError):
+        model_config = {}
+    if model_config.get("model_type") == "laguna":
+        return True
+
     # Heuristic: if the template only disables thinking when explicitly
     # ``enable_thinking is false``, then thinking is ON by default.
     # If the template requires ``enable_thinking`` to be truthy or uses
     # ``default(false)``, then thinking is OFF by default.
     if "enable_thinking is false" in template_text:
         return True  # ON by default (Qwen pattern)
+    # An explicit ``enable_thinking | default(true)`` filter states the ON
+    # default directly. It must be anchored and checked before the broad
+    # ``default(false)`` scan: a template may default *other* flags to false
+    # (e.g. ``preserve_thinking | default(false)``, Laguna S-2.1) without
+    # changing its thinking default.
+    if re.search(r"enable_thinking\s*\|\s*default\(true\)", template_text):
+        return True
     if "default(false)" in template_text or "enable_thinking)" in template_text:
         return False  # OFF by default (Gemma pattern)
 
@@ -929,6 +975,87 @@ def estimate_model_size(model_path: Path) -> int:
     overhead_factor = 1.05
 
     return int(total_size * overhead_factor)
+
+
+# Weight-name prefixes that the text-only (mlx-lm) loaders drop when serving a
+# VLM-shaped checkpoint: qwen3_5(_moe) sanitize strips ``vision_tower.*`` and
+# ``model.visual.*``; the projector/vision-model spellings cover the other
+# families that ship text-only loadable checkpoints.
+_VISION_WEIGHT_PREFIXES = (
+    "vision_tower.",
+    "model.vision_tower.",
+    "visual.",
+    "model.visual.",
+    "vision_model.",
+    "model.vision_model.",
+    "multi_modal_projector.",
+    "model.multi_modal_projector.",
+)
+
+_SAFETENSORS_DTYPE_BYTES = {
+    "F64": 8, "I64": 8, "U64": 8,
+    "F32": 4, "I32": 4, "U32": 4,
+    "F16": 2, "BF16": 2, "I16": 2, "U16": 2,
+    "F8_E4M3": 1, "F8_E5M2": 1, "I8": 1, "U8": 1, "BOOL": 1,
+}
+
+
+def _vision_weight_bytes(model_path: Path) -> int:
+    """Sum tensor bytes under known vision prefixes from safetensors headers.
+
+    Reads only each shard's JSON header (dtype x shape per tensor), never the
+    weight data. Returns 0 when no shard parses or nothing matches.
+    """
+    import struct
+
+    total = 0
+    for shard in model_path.glob("*.safetensors"):
+        try:
+            with open(shard, "rb") as f:
+                (header_len,) = struct.unpack("<Q", f.read(8))
+                if header_len > 512 * 1024 * 1024:  # corrupt / not safetensors
+                    continue
+                header = json.loads(f.read(header_len))
+        except (OSError, ValueError, struct.error):
+            continue
+        for name, meta in header.items():
+            if name == "__metadata__" or not name.startswith(
+                _VISION_WEIGHT_PREFIXES
+            ):
+                continue
+            try:
+                dtype_size = _SAFETENSORS_DTYPE_BYTES.get(meta["dtype"], 0)
+                numel = 1
+                for dim in meta["shape"]:
+                    numel *= dim
+                total += numel * dtype_size
+            except (KeyError, TypeError):
+                continue
+    return total
+
+
+def estimate_text_only_model_size(model_path: Path) -> int:
+    """
+    Estimate memory usage when only the language part of a VLM-shaped
+    checkpoint is loaded (force_lm / model_type_override): the text loaders
+    drop the vision tower, so admission by the full file size over-charges by
+    the vision weights (#2385).
+
+    Returns 0 when there are no vision weights to subtract (plain text
+    checkpoints, unreadable shards) — callers fall back to
+    :func:`estimate_model_size`.
+    """
+    try:
+        vision_bytes = _vision_weight_bytes(model_path)
+        if vision_bytes <= 0:
+            return 0
+        full = estimate_model_size(model_path)
+    except (OSError, ValueError):
+        return 0
+    text_only = full - int(vision_bytes * 1.05)
+    if 0 < text_only < full:
+        return text_only
+    return 0
 
 
 def _is_adapter_dir(path: Path) -> bool:
@@ -1190,6 +1317,9 @@ def _register_model(
         else:
             engine_type = "batched"
         estimated_size = estimate_model_size(model_dir)
+        text_only_size = (
+            estimate_text_only_model_size(model_dir) if model_type == "vlm" else 0
+        )
 
         # Read raw config model_type for sub-type detection (e.g., OCR models)
         # and flag speculative-decoding drafters (dFlash/Assistant/MTP).
@@ -1214,6 +1344,7 @@ def _register_model(
             model_type=model_type,
             engine_type=engine_type,
             estimated_size=estimated_size,
+            text_only_size=text_only_size,
             config_model_type=config_model_type,
             thinking_default=thinking_default,
             preserve_thinking_default=preserve_thinking_default,
@@ -1224,9 +1355,15 @@ def _register_model(
         )
 
         size_gb = estimated_size / (1024**3)
+        text_only_note = (
+            f", text-only: {text_only_size / (1024 ** 3):.2f}GB"
+            if text_only_size
+            else ""
+        )
         logger.info(
             f"Discovered model: {model_id} "
-            f"(type: {model_type}, engine: {engine_type}, size: {size_gb:.2f}GB)"
+            f"(type: {model_type}, engine: {engine_type}, "
+            f"size: {size_gb:.2f}GB{text_only_note})"
         )
     except Exception as e:
         logger.error(f"Failed to discover model {model_id}: {e}")

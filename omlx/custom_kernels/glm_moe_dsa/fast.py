@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Any
 
 import mlx.core as mx
@@ -23,6 +24,16 @@ try:
 except Exception as exc:  # pragma: no cover - depends on local native build
     _ext = None
     _IMPORT_ERROR = _detach_import_error(exc)
+    # Default installs ship no extension; warn only when a built _ext fails
+    # to load (e.g. unresolved @rpath/libmlx.dylib, issue #2233) so the
+    # silent-slow-path fallback leaves a trace in the server log.
+    if any(Path(__file__).parent.glob("_ext*.so")):
+        logger.warning(
+            "%s: native extension is present but failed to load; falling "
+            "back to the slow path: %s",
+            __name__,
+            _IMPORT_ERROR,
+        )
 else:
     _IMPORT_ERROR = None
 
@@ -59,11 +70,16 @@ _ext, _IMPORT_ERROR = _verify_abi(_ext, _IMPORT_ERROR)
 
 
 NATIVE_SYMBOLS = (
+    "dsa_decode_scores",
     "dsa_indexer_scores",
     "dsa_topk_indices",
+    "dspark_fp32_topk_indices",
+    "dspark_exact_mxfp8_qmv_pair",
     "glm_dsa_sparse_mla_attention",
     "glm_dsa_exact_block_attention",
     "deepseek_v4_sparse_attention",
+    "dspark_ring_gemm",
+    "dspark_rowwise_gemm",
     "glm_dsa_q8_vup_flat",
     "glm_moe_weighted_sum",
     "deepseek_mxfp4_gather_qmm_blocks",
@@ -138,6 +154,27 @@ def dsa_indexer_scores(
     )
 
 
+def dsa_decode_scores(
+    queries: mx.array,
+    keys: mx.array,
+    weights: mx.array,
+    fp32_scores: bool = False,
+    *,
+    stream=None,
+) -> mx.array:
+    if _ext is None:
+        raise RuntimeError(
+            "dsa_decode_scores requires the native glm_moe_dsa extension"
+        )
+    return _ext.dsa_decode_scores(
+        queries,
+        keys,
+        weights,
+        fp32_scores=fp32_scores,
+        **_native_stream_kwargs(stream),
+    )
+
+
 def dsa_topk_indices(
     scores: mx.array,
     topk: int,
@@ -160,6 +197,21 @@ def dsa_topk_indices(
         bucketed=bucketed,
         causal_valid_prefix=causal_valid_prefix,
         stream=stream or mx.gpu,
+    )
+
+
+def dspark_fp32_topk_indices(
+    scores: mx.array,
+    topk: int = 512,
+    *,
+    stream=None,
+) -> mx.array:
+    if _ext is None or not hasattr(_ext, "dspark_fp32_topk_indices"):
+        raise RuntimeError("DSpark FP32 top-k kernel is unavailable")
+    return _ext.dspark_fp32_topk_indices(
+        scores,
+        topk,
+        **_native_stream_kwargs(stream),
     )
 
 
@@ -240,6 +292,63 @@ def glm_dsa_exact_block_attention(
         scale,
         causal=causal,
         stream=stream or mx.gpu,
+    )
+
+
+def dspark_rowwise_gemm(
+    lhs: mx.array,
+    rhs: mx.array,
+    transpose_rhs: bool,
+    *,
+    stream=None,
+) -> mx.array:
+    if _ext is None or not hasattr(_ext, "dspark_rowwise_gemm"):
+        raise RuntimeError("DSpark rowwise NAX GEMM is unavailable")
+    return _ext.dspark_rowwise_gemm(
+        lhs,
+        rhs,
+        transpose_rhs,
+        **_native_stream_kwargs(stream),
+    )
+
+
+def dspark_ring_gemm(
+    lhs: mx.array,
+    source: mx.array,
+    indices: mx.array,
+    transpose_rhs: bool,
+    *,
+    stream=None,
+) -> mx.array:
+    if _ext is None or not hasattr(_ext, "dspark_ring_gemm"):
+        raise RuntimeError("DSpark physical-ring GEMM is unavailable")
+    return _ext.dspark_ring_gemm(
+        lhs,
+        source,
+        indices,
+        transpose_rhs,
+        **_native_stream_kwargs(stream),
+    )
+
+
+def dspark_exact_mxfp8_qmv_pair(
+    input: mx.array,
+    weight_a: mx.array,
+    scales_a: mx.array,
+    weight_b: mx.array,
+    scales_b: mx.array,
+    *,
+    stream=None,
+) -> mx.array:
+    if _ext is None or not hasattr(_ext, "dspark_exact_mxfp8_qmv_pair"):
+        raise RuntimeError("DSpark exact MXFP8 QMV pair kernel is unavailable")
+    return _ext.dspark_exact_mxfp8_qmv_pair(
+        input,
+        weight_a,
+        scales_a,
+        weight_b,
+        scales_b,
+        **_native_stream_kwargs(stream),
     )
 
 

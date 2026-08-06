@@ -37,6 +37,10 @@ import numpy as np
 from omlx.utils.formatting import format_bytes
 
 from .interface import CacheManager
+from .pooling_delta import (
+    POOLING_CACHE_DELTA_CLASS,
+    POOLING_CACHE_DELTA_FORMAT_VERSION,
+)
 from .stats import PagedSSDCacheStats
 
 logger = logging.getLogger(__name__)
@@ -155,8 +159,11 @@ _CACHE_FORMAT_VERSION = "3"
 # Versions whose blocks the current code can read. V3 polyfills V2 blocks
 # whose layer data was stored as the legacy 2-tuple `(keys, values)` —
 # they are upgraded to N-tuple markers on read so the rest of omlx core
-# sees a uniform shape. New writes always use V3.
-_READABLE_CACHE_FORMAT_VERSIONS = frozenset({"2", "3"})
+# sees a uniform shape. New writes use V3 unless a PoolingCache block carries
+# the V4 append-only delta representation.
+_READABLE_CACHE_FORMAT_VERSIONS = frozenset(
+    {"2", "3", POOLING_CACHE_DELTA_FORMAT_VERSION}
+)
 
 
 # Layer cache type names whose meta_state should be clamped on save so the
@@ -204,6 +211,7 @@ def _canonicalize_layer_cache_types(
     wrapper_to_canonical = {
         "SizedArraysCache": "ArraysCache",
         "PrefillReadyRotatingKVCache": "RotatingKVCache",
+        POOLING_CACHE_DELTA_CLASS: "PoolingCache",
         # Batch and single-request TurboQuant caches persist the same packed
         # per-request state (the save path records whichever class name it
         # extracted; the restore path rebuilds a TurboQuantKVCache from
@@ -225,6 +233,7 @@ def _cache_compat_signature(
     block_size: int = 0,
     layer_cache_types: list[str] | None = None,
     turboquant_kv_bits: float | None = None,
+    cachelist_subtypes: dict[str, list[str]] | None = None,
 ) -> str:
     """Return a stable compatibility signature for a persisted cache block."""
     payload = {
@@ -240,6 +249,14 @@ def _cache_compat_signature(
     # byte-identical to the previous format.
     if turboquant_kv_bits is not None:
         payload["turboquant_kv_bits"] = float(turboquant_kv_bits)
+    # Mixed CacheList layers (a non-sliceable sub next to a KVCache, e.g.
+    # inkling's CacheList(KVCache, ArraysCache(4))) additionally stamp
+    # their sub composition: the flat "CacheList" type name cannot tell a
+    # 2-slot ArraysCache block from a 4-slot one, and restoring the wrong
+    # arity IndexErrors in the model. Only stamped when such layers exist
+    # so other signatures stay byte-identical to the previous format.
+    if cachelist_subtypes:
+        payload["cachelist_subtypes"] = cachelist_subtypes
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
 
@@ -290,6 +307,150 @@ def _block_turboquant_bits(
             except (TypeError, ValueError):
                 return None
     return None
+
+
+_CACHELIST_NON_SLICEABLE_SUB_CLASSES = frozenset(
+    {
+        "ArraysCache",
+        "SizedArraysCache",
+        "PoolingCache",
+        "BatchPoolingCache",
+        "RotatingKVCache",
+        "BatchRotatingKVCache",
+        "PrefillReadyRotatingKVCache",
+        "BufferedRotatingKVCache",
+    }
+)
+
+_ARRAYS_SUB_CLASSES = frozenset({"ArraysCache", "SizedArraysCache"})
+_POOLING_SUB_CLASSES = frozenset({"PoolingCache", "BatchPoolingCache"})
+
+
+def _canonical_sub_name(name: Any) -> str:
+    """Canonicalize one CacheList sub-cache class name for signatures."""
+    canonical = _canonicalize_layer_cache_types([str(name or "")])
+    return canonical[0] if canonical else ""
+
+
+def _signature_cachelist_subtypes(cache_signature: str) -> dict | None:
+    """Extract ``cachelist_subtypes`` from a stored signature, or None."""
+    if not cache_signature:
+        return None
+    try:
+        payload = json.loads(cache_signature)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    subtypes = payload.get("cachelist_subtypes")
+    return subtypes if isinstance(subtypes, dict) else None
+
+
+def _block_cachelist_subtypes(
+    cache_data: list[Any] | None,
+    layer_cache_types: list[str] | None,
+    layer_meta_states: list[tuple] | None,
+) -> dict[str, list[str]] | None:
+    """Describe mixed CacheList layers' sub composition from block payload.
+
+    Only layers whose composition contains a non-sliceable sub class are
+    stamped, so signatures of KVCache-only CacheList models (GLM /
+    deepseek_v32) stay byte-identical to the previous format. ArraysCache
+    descriptors carry the slot count (``"ArraysCache:4"``), while pooling
+    descriptors carry the logical state arity (``"PoolingCache:5"``).
+    Both values are part of the persisted layout identity.
+    """
+    if not cache_data or not layer_cache_types:
+        return None
+    subtypes: dict[str, list[str]] = {}
+    for i, cache_type in enumerate(layer_cache_types):
+        if cache_type != "CacheList" or i >= len(cache_data):
+            continue
+        layer_data = cache_data[i]
+        if not (
+            isinstance(layer_data, tuple)
+            and len(layer_data) == 2
+            and layer_data[0] == "__cache_list__"
+            and isinstance(layer_data[1], (list, tuple))
+        ):
+            continue
+        meta_names: list[Any] = []
+        if (
+            layer_meta_states
+            and i < len(layer_meta_states)
+            and isinstance(layer_meta_states[i], (list, tuple))
+            and len(layer_meta_states[i]) >= 1
+            and isinstance(layer_meta_states[i][0], (list, tuple))
+        ):
+            meta_names = list(layer_meta_states[i][0])
+        descriptors: list[str] = []
+        has_non_sliceable = False
+        for j, sub_tensor in enumerate(layer_data[1]):
+            name = _canonical_sub_name(meta_names[j] if j < len(meta_names) else "")
+            element_count = None
+            is_pooling_delta = False
+            if (
+                isinstance(sub_tensor, tuple)
+                and len(sub_tensor) >= 3
+                and sub_tensor[0] == "__nstate__"
+            ):
+                if not name:
+                    name = _canonical_sub_name(sub_tensor[1])
+                if isinstance(sub_tensor[2], (list, tuple)):
+                    element_count = len(sub_tensor[2])
+                    is_pooling_delta = sub_tensor[1] == POOLING_CACHE_DELTA_CLASS
+            elif isinstance(sub_tensor, (list, tuple)):
+                element_count = len(sub_tensor)
+            if name in _CACHELIST_NON_SLICEABLE_SUB_CLASSES:
+                has_non_sliceable = True
+            if name in _ARRAYS_SUB_CLASSES and element_count is not None:
+                descriptors.append(f"ArraysCache:{element_count}")
+            elif name in _POOLING_SUB_CLASSES and element_count is not None:
+                logical_count = element_count - 1 if is_pooling_delta else element_count
+                descriptors.append(f"{name}:{logical_count}")
+            else:
+                descriptors.append(name or "?")
+        if descriptors and has_non_sliceable:
+            subtypes[str(i)] = descriptors
+    return subtypes or None
+
+
+def cachelist_subtypes_from_cache_list(
+    cache_list: list[Any] | tuple[Any, ...] | None,
+) -> dict[str, list[str]] | None:
+    """Describe mixed CacheList layers' sub composition from live caches.
+
+    The live-model counterpart of ``_block_cachelist_subtypes`` — produces
+    the expectation the manager compares stored blocks against. Stamps the
+    same layers (composition contains a non-sliceable sub) with the same
+    descriptor format.
+    """
+    if not cache_list:
+        return None
+    subtypes: dict[str, list[str]] = {}
+    for i, cache_obj in enumerate(cache_list):
+        sub_caches = getattr(cache_obj, "caches", None)
+        if type(cache_obj).__name__ != "CacheList" or not sub_caches:
+            continue
+        descriptors: list[str] = []
+        has_non_sliceable = False
+        for sub in sub_caches:
+            name = _canonical_sub_name(type(sub).__name__)
+            if name in _CACHELIST_NON_SLICEABLE_SUB_CLASSES:
+                has_non_sliceable = True
+            if name in _ARRAYS_SUB_CLASSES:
+                slots = getattr(sub, "cache", None)
+                slot_count = len(slots) if isinstance(slots, list) else 0
+                descriptors.append(f"ArraysCache:{slot_count}")
+            elif name in _POOLING_SUB_CLASSES:
+                state = getattr(sub, "state", ())
+                state_count = len(state) if isinstance(state, (list, tuple)) else 0
+                descriptors.append(f"{name}:{state_count}")
+            else:
+                descriptors.append(name or "?")
+        if descriptors and has_non_sliceable:
+            subtypes[str(i)] = descriptors
+    return subtypes or None
 
 
 def _clamp_rotating_meta_states(
@@ -356,6 +517,143 @@ def _encode_shape(shape) -> str:
 def _decode_shape(shape_str: str) -> tuple:
     """Decode shape string back to tuple of ints."""
     return tuple(int(d) for d in shape_str.split(","))
+
+
+def _store_nstate_elements_flat(
+    arrays: dict[str, Any],
+    cache_list_meta: dict[str, str],
+    prefix: str,
+    elements,
+) -> None:
+    """Write N elements as ``{prefix}_state_{k}`` keys with a
+    ``{prefix}_state_count`` count marker. Zero-dim shapes are
+    preserved via ``{prefix}_state_{k}_zero_dim``. Composite
+    elements (a bare tuple/list or a nested ``__nstate__``
+    marker) recurse under a ``{elem_key}`` sub-prefix and record
+    a ``{elem_key}_nested`` marker; the flat ``{elem_key}``
+    tensor is deliberately omitted so an older reader hits its
+    ``Missing {elem_key} in arrays`` path and skips the block.
+
+    Module-level on purpose — same recursive-closure cycle bug as
+    ``_load_nstate_flat`` (see that docstring).
+    """
+    cache_list_meta[f"{prefix}_state_count"] = str(len(elements))
+    for k, elem in enumerate(elements):
+        elem_key = f"{prefix}_state_{k}"
+        if elem is None:
+            # None placeholder — store an empty marker tensor
+            # and a sentinel zero_dim entry so the loader can
+            # restore None instead of materializing zeros.
+            arrays[elem_key] = mx.zeros((1,))
+            cache_list_meta[f"{elem_key}_none"] = "1"
+        elif _has_zero_dim(elem):
+            arrays[elem_key] = mx.zeros((1,))
+            cache_list_meta[f"{elem_key}_zero_dim"] = _encode_shape(elem.shape)
+        elif (
+            isinstance(elem, tuple)
+            and len(elem) >= 2
+            and isinstance(elem[0], str)
+            and elem[0] == "__nstate__"
+        ):
+            # Nested ``('__nstate__', class_name, [sub...])``
+            # marker — recurse, no flat tensor written.
+            cache_list_meta[f"{elem_key}_nested"] = "nstate"
+            sub_class = elem[1] if len(elem) >= 2 else None
+            sub_elements = elem[2] if len(elem) >= 3 else []
+            if sub_class:
+                cache_list_meta[f"{elem_key}_state_class_name"] = sub_class
+            _store_nstate_elements_flat(arrays, cache_list_meta, elem_key, sub_elements)
+        elif isinstance(elem, (tuple, list)):
+            # Bare tuple/list of sub-elements — recurse, no flat
+            # tensor written.
+            cache_list_meta[f"{elem_key}_nested"] = "tuple"
+            _store_nstate_elements_flat(arrays, cache_list_meta, elem_key, list(elem))
+        else:
+            if not isinstance(elem, mx.array):
+                raise TypeError(
+                    f"unsupported non-array nstate element "
+                    f"{elem_key}: {type(elem).__name__}"
+                )
+            arrays[elem_key] = elem
+
+
+def _load_nstate_flat(
+    arrays: dict[str, Any],
+    file_metadata: dict[str, str],
+    prefix: str,
+    fallback_class: str | None,
+) -> tuple | None:
+    """Read either V3 ``state_count`` keys or V2 ``keys``/``values``
+    polyfill at ``prefix``. Returns ``('__nstate__', class_name, elements)``
+    on success or None on missing tensors.
+
+    Module-level on purpose: the previous nested-closure version formed a
+    self-referential cycle (recursive closure) that captured ``arrays`` —
+    hundreds of MB of KV tensors — and only gen-2 gc could free it.
+    """
+    count_key = f"{prefix}_state_count"
+    class_name = None
+    if file_metadata:
+        class_name = file_metadata.get(f"{prefix}_state_class_name")
+    if class_name is None:
+        class_name = fallback_class
+
+    elements: list[Any] = []
+    if file_metadata and count_key in file_metadata:
+        # V3 path
+        try:
+            count = int(file_metadata[count_key])
+        except (ValueError, TypeError):
+            return None
+        for k in range(count):
+            elem_key = f"{prefix}_state_{k}"
+            none_marker = f"{elem_key}_none"
+            zd_marker = f"{elem_key}_zero_dim"
+            nested_marker = f"{elem_key}_nested"
+            if file_metadata and none_marker in file_metadata:
+                elements.append(None)
+                continue
+            if file_metadata and nested_marker in file_metadata:
+                # Composite element — recurse, then restore the same
+                # shape it had on save (bare tuple vs __nstate__).
+                sub = _load_nstate_flat(arrays, file_metadata, elem_key, None)
+                if sub is None:
+                    return None
+                if file_metadata[nested_marker] == "tuple":
+                    elements.append(tuple(sub[2]))
+                elif file_metadata[nested_marker] == "nstate":
+                    # Explicit marker on write — preserve the full
+                    # ('__nstate__', class_name, elements) as-is;
+                    # never unwrap (would drop the marker/class_name).
+                    elements.append(sub)
+                else:
+                    # Corrupt/unknown nested marker — fail closed.
+                    return None
+                continue
+            if elem_key not in arrays:
+                logger.error(f"Missing {elem_key} in arrays")
+                return None
+            if file_metadata and zd_marker in file_metadata:
+                elements.append(mx.zeros(_decode_shape(file_metadata[zd_marker])))
+            else:
+                elements.append(arrays[elem_key])
+    else:
+        # V2 polyfill: legacy ``{prefix}_keys`` / ``{prefix}_values``.
+        keys_key = f"{prefix}_keys"
+        values_key = f"{prefix}_values"
+        if keys_key not in arrays or values_key not in arrays:
+            return None
+        k_zd = f"{prefix}_keys_zero_dim"
+        v_zd = f"{prefix}_values_zero_dim"
+        if file_metadata and k_zd in file_metadata:
+            elements.append(mx.zeros(_decode_shape(file_metadata[k_zd])))
+        else:
+            elements.append(arrays[keys_key])
+        if file_metadata and v_zd in file_metadata:
+            elements.append(mx.zeros(_decode_shape(file_metadata[v_zd])))
+        else:
+            elements.append(arrays[values_key])
+    return ("__nstate__", class_name, elements)
 
 
 # --- Safetensors dtype mapping for background-thread-safe serialization ---
@@ -1079,6 +1377,11 @@ class PagedSSDCacheManager(CacheManager):
         # (the depth is only known once the engine has applied the model's
         # TurboQuant settings, after this manager is constructed).
         self._expected_turboquant_kv_bits: float | None = None
+        # Sub composition of mixed CacheList layers (see
+        # ``cachelist_subtypes_from_cache_list``); learned together with
+        # the layer signature. None disables the check (legacy managers /
+        # models without mixed CacheList layers).
+        self._expected_cachelist_subtypes: dict[str, list[str]] | None = None
         # Set once we have swept stale-signature blocks for the current
         # ``_expected_layer_cache_types`` / ``_expected_turboquant_kv_bits``.
         # Re-assigning the signature (e.g., via
@@ -1561,6 +1864,15 @@ class PagedSSDCacheManager(CacheManager):
             ) != _canonicalize_layer_cache_types(self._expected_layer_cache_types):
                 return False
 
+        # The block must PROVE a matching CacheList sub composition — an
+        # unstamped or mismatched block would rebuild a CacheList whose
+        # sub arity/classes disagree with the live model.
+        if (
+            self._expected_cachelist_subtypes is not None
+            and payload.get("cachelist_subtypes") != self._expected_cachelist_subtypes
+        ):
+            return False
+
         if not self._signature_bits_match(metadata.cache_signature):
             return False
 
@@ -1583,6 +1895,54 @@ class PagedSSDCacheManager(CacheManager):
             == self._expected_turboquant_kv_bits
         )
 
+    def is_signature_compatible(self, cache_signature: str) -> bool:
+        """Per-block signature gate for restore paths that bypass the
+        index scan (hot-cache / pending-write loads never pass through
+        ``_is_compatible_block``). Checks the expectation-gated signature
+        fields: TurboQuant depth and CacheList sub composition.
+        """
+        return self.signature_mismatch_reason(cache_signature) is None
+
+    def signature_mismatch_reason(self, cache_signature: str) -> str | None:
+        """Describe the first expectation-gated signature mismatch."""
+        cache_signature = cache_signature or ""
+        if not self._signature_bits_match(cache_signature):
+            actual_bits = _signature_turboquant_bits(cache_signature)
+            actual = "missing" if actual_bits is None else str(actual_bits)
+            return (
+                "TurboQuant depth: expected "
+                f"{self._expected_turboquant_kv_bits}, got {actual}"
+            )
+
+        expected_subtypes = self._expected_cachelist_subtypes
+        if expected_subtypes is None:
+            return None
+
+        actual_subtypes = _signature_cachelist_subtypes(cache_signature)
+        if actual_subtypes == expected_subtypes:
+            return None
+
+        actual_layers = actual_subtypes or {}
+
+        def _layer_sort_key(layer: str) -> tuple[int, int | str]:
+            try:
+                return (0, int(layer))
+            except (TypeError, ValueError):
+                return (1, str(layer))
+
+        for layer in sorted(
+            set(expected_subtypes) | set(actual_layers), key=_layer_sort_key
+        ):
+            expected = expected_subtypes.get(layer)
+            actual = actual_layers.get(layer)
+            if expected != actual:
+                return (
+                    f"CacheList sub composition at layer {layer}: "
+                    f"expected {expected}, got {actual}"
+                )
+
+        return "CacheList sub composition mismatch"
+
     def _expected_cache_signature(self) -> str:
         if (
             not self._expected_model_name
@@ -1597,6 +1957,7 @@ class PagedSSDCacheManager(CacheManager):
             block_size=self._expected_block_size,
             layer_cache_types=self._expected_layer_cache_types,
             turboquant_kv_bits=self._expected_turboquant_kv_bits,
+            cachelist_subtypes=self._expected_cachelist_subtypes,
         )
 
     def _read_file_metadata(self, file_path: Path) -> PagedSSDBlockMetadata | None:
@@ -1645,18 +2006,34 @@ class PagedSSDCacheManager(CacheManager):
             layer_cache_types = None
             layer_meta_states = None
 
+            # A present-but-unparseable field is corruption (torn write,
+            # damaged file), not a legacy block: indexing the block with the
+            # field silently dropped would make reconstruction guess layer
+            # types or per-layer meta for its tensors. Treat the block as
+            # unusable; the hash then misses and the next request re-stores
+            # it. Absent fields (legacy blocks) still pass through.
             if "layer_cache_types" in metadata and metadata["layer_cache_types"]:
                 try:
                     layer_cache_types = json.loads(metadata["layer_cache_types"])
                 except (json.JSONDecodeError, TypeError):
-                    pass
+                    logger.warning(
+                        "Corrupt layer_cache_types metadata JSON in cache "
+                        "file %s; treating the block as unusable.",
+                        file_path,
+                    )
+                    return None
 
             if "layer_meta_states" in metadata and metadata["layer_meta_states"]:
                 try:
                     raw_meta_states = json.loads(metadata["layer_meta_states"])
                     layer_meta_states = [tuple(m) if m else () for m in raw_meta_states]
                 except (json.JSONDecodeError, TypeError):
-                    pass
+                    logger.warning(
+                        "Corrupt layer_meta_states metadata JSON in cache "
+                        "file %s; treating the block as unusable.",
+                        file_path,
+                    )
+                    return None
 
             return PagedSSDBlockMetadata(
                 block_hash=bytes.fromhex(block_hash_hex),
@@ -1850,17 +2227,48 @@ class PagedSSDCacheManager(CacheManager):
             except Exception as e:
                 logger.warning("Stale-signature sweep failed: %s", e)
 
-        # Check if already exists in index (thread-safe)
-        if self._index.contains(block_hash):
+        # A matching content hash does not guarantee a matching serialized
+        # layout. Replace an indexed block written by an older cache schema
+        # instead of treating it as an unconditional hit (#2487).
+        indexed_metadata = self._index.get(block_hash)
+        if indexed_metadata is not None and self._is_compatible_block(indexed_metadata):
             self._index.touch(block_hash)
             self._stats["hits"] += 1
             return True
+        if indexed_metadata is not None:
+            reason = (
+                self.signature_mismatch_reason(indexed_metadata.cache_signature)
+                or "cache layout mismatch"
+            )
+            logger.info(
+                "Replacing incompatible indexed cache block %s: %s",
+                block_hash.hex()[:16],
+                reason,
+            )
+            self.forget_block(block_hash)
 
         # Also check hot cache / pending writes buffer
         hot_entry = None
         with self._hot_cache_lock:
             if block_hash in self._hot_cache:
                 hot_entry = self._hot_cache[block_hash]
+
+        if hot_entry is not None:
+            hot_metadata = hot_entry.get("block_metadata")
+            if isinstance(
+                hot_metadata, PagedSSDBlockMetadata
+            ) and not self._is_compatible_block(hot_metadata):
+                reason = (
+                    self.signature_mismatch_reason(hot_metadata.cache_signature)
+                    or "cache layout mismatch"
+                )
+                logger.info(
+                    "Replacing incompatible hot cache block %s: %s",
+                    block_hash.hex()[:16],
+                    reason,
+                )
+                self.forget_block(block_hash)
+                hot_entry = None
 
         if hot_entry is not None:
             if hot_cache_write_back or self._hot_cache_only:
@@ -1896,59 +2304,15 @@ class PagedSSDCacheManager(CacheManager):
             #   is uniform regardless of whether the producer (prefix_cache,
             #   etc.) has been migrated to emit ``__nstate__`` markers yet.
             arrays = {}
+            has_pooling_cache_delta = False
             cache_list_meta = (
                 {}
             )  # Per-layer sidecar metadata (sub_count, state_count, etc.)
 
+            # Shim; module-level to avoid a recursive-closure refcount
+            # cycle pinning `arrays` — see _store_nstate_elements_flat.
             def _store_nstate_elements(prefix: str, elements):
-                """Write N elements as ``{prefix}_state_{k}`` keys with a
-                ``{prefix}_state_count`` count marker. Zero-dim shapes are
-                preserved via ``{prefix}_state_{k}_zero_dim``. Composite
-                elements (a bare tuple/list or a nested ``__nstate__``
-                marker) recurse under a ``{elem_key}`` sub-prefix and record
-                a ``{elem_key}_nested`` marker; the flat ``{elem_key}``
-                tensor is deliberately omitted so an older reader hits its
-                ``Missing {elem_key} in arrays`` path and skips the block."""
-                cache_list_meta[f"{prefix}_state_count"] = str(len(elements))
-                for k, elem in enumerate(elements):
-                    elem_key = f"{prefix}_state_{k}"
-                    if elem is None:
-                        # None placeholder — store an empty marker tensor
-                        # and a sentinel zero_dim entry so the loader can
-                        # restore None instead of materializing zeros.
-                        arrays[elem_key] = mx.zeros((1,))
-                        cache_list_meta[f"{elem_key}_none"] = "1"
-                    elif _has_zero_dim(elem):
-                        arrays[elem_key] = mx.zeros((1,))
-                        cache_list_meta[f"{elem_key}_zero_dim"] = _encode_shape(
-                            elem.shape
-                        )
-                    elif (
-                        isinstance(elem, tuple)
-                        and len(elem) >= 2
-                        and isinstance(elem[0], str)
-                        and elem[0] == "__nstate__"
-                    ):
-                        # Nested ``('__nstate__', class_name, [sub...])``
-                        # marker — recurse, no flat tensor written.
-                        cache_list_meta[f"{elem_key}_nested"] = "nstate"
-                        sub_class = elem[1] if len(elem) >= 2 else None
-                        sub_elements = elem[2] if len(elem) >= 3 else []
-                        if sub_class:
-                            cache_list_meta[f"{elem_key}_state_class_name"] = sub_class
-                        _store_nstate_elements(elem_key, sub_elements)
-                    elif isinstance(elem, (tuple, list)):
-                        # Bare tuple/list of sub-elements — recurse, no flat
-                        # tensor written.
-                        cache_list_meta[f"{elem_key}_nested"] = "tuple"
-                        _store_nstate_elements(elem_key, list(elem))
-                    else:
-                        if not isinstance(elem, mx.array):
-                            raise TypeError(
-                                f"unsupported non-array nstate element "
-                                f"{elem_key}: {type(elem).__name__}"
-                            )
-                        arrays[elem_key] = elem
+                _store_nstate_elements_flat(arrays, cache_list_meta, prefix, elements)
 
             for i, layer_data in enumerate(cache_data):
                 if (
@@ -1962,6 +2326,8 @@ class PagedSSDCacheManager(CacheManager):
                     elements = layer_data[2] if len(layer_data) >= 3 else []
                     if class_name:
                         cache_list_meta[f"layer_{i}_state_class_name"] = class_name
+                    if class_name == POOLING_CACHE_DELTA_CLASS:
+                        has_pooling_cache_delta = True
                     _store_nstate_elements(f"layer_{i}", elements)
                 elif (
                     isinstance(layer_data, tuple)
@@ -1989,6 +2355,8 @@ class PagedSSDCacheManager(CacheManager):
                                 cache_list_meta[f"{sub_prefix}_state_class_name"] = (
                                     sub_class_name
                                 )
+                            if sub_class_name == POOLING_CACHE_DELTA_CLASS:
+                                has_pooling_cache_delta = True
                             _store_nstate_elements(sub_prefix, sub_elements)
                         elif (
                             isinstance(sub_tensor, (list, tuple))
@@ -2052,11 +2420,20 @@ class PagedSSDCacheManager(CacheManager):
                     if block_bits is not None
                     else self._expected_turboquant_kv_bits
                 ),
+                # Stamped from the block's own payload (observation), like
+                # the TurboQuant depth above.
+                cachelist_subtypes=_block_cachelist_subtypes(
+                    cache_data, layer_cache_types, layer_meta_states
+                ),
             )
 
             # Prepare metadata
             metadata = {
-                "omlx_cache_format_version": _CACHE_FORMAT_VERSION,
+                "omlx_cache_format_version": (
+                    POOLING_CACHE_DELTA_FORMAT_VERSION
+                    if has_pooling_cache_delta
+                    else _CACHE_FORMAT_VERSION
+                ),
                 "block_hash": block_hash.hex(),
                 "token_count": str(token_count),
                 "num_layers": str(len(cache_data)),
@@ -2278,75 +2655,10 @@ class PagedSSDCacheManager(CacheManager):
                 return (elements[0], elements[1])
             return marker
 
+        # Shim; module-level to avoid a recursive-closure refcount
+        # cycle pinning `arrays` — see _load_nstate_flat.
         def _load_nstate(prefix: str, fallback_class: str | None) -> tuple | None:
-            """Read either V3 ``state_count`` keys or V2 ``keys``/``values``
-            polyfill at ``prefix``. Returns ``('__nstate__', class_name, elements)``
-            on success or None on missing tensors."""
-            count_key = f"{prefix}_state_count"
-            class_name = None
-            if file_metadata:
-                class_name = file_metadata.get(f"{prefix}_state_class_name")
-            if class_name is None:
-                class_name = fallback_class
-
-            elements: list[Any] = []
-            if file_metadata and count_key in file_metadata:
-                # V3 path
-                try:
-                    count = int(file_metadata[count_key])
-                except (ValueError, TypeError):
-                    return None
-                for k in range(count):
-                    elem_key = f"{prefix}_state_{k}"
-                    none_marker = f"{elem_key}_none"
-                    zd_marker = f"{elem_key}_zero_dim"
-                    nested_marker = f"{elem_key}_nested"
-                    if file_metadata and none_marker in file_metadata:
-                        elements.append(None)
-                        continue
-                    if file_metadata and nested_marker in file_metadata:
-                        # Composite element — recurse, then restore the same
-                        # shape it had on save (bare tuple vs __nstate__).
-                        sub = _load_nstate(elem_key, fallback_class=None)
-                        if sub is None:
-                            return None
-                        if file_metadata[nested_marker] == "tuple":
-                            elements.append(tuple(sub[2]))
-                        elif file_metadata[nested_marker] == "nstate":
-                            # Explicit marker on write — preserve the full
-                            # ('__nstate__', class_name, elements) as-is;
-                            # never unwrap (would drop the marker/class_name).
-                            elements.append(sub)
-                        else:
-                            # Corrupt/unknown nested marker — fail closed.
-                            return None
-                        continue
-                    if elem_key not in arrays:
-                        logger.error(f"Missing {elem_key} in arrays")
-                        return None
-                    if file_metadata and zd_marker in file_metadata:
-                        elements.append(
-                            mx.zeros(_decode_shape(file_metadata[zd_marker]))
-                        )
-                    else:
-                        elements.append(arrays[elem_key])
-            else:
-                # V2 polyfill: legacy ``{prefix}_keys`` / ``{prefix}_values``.
-                keys_key = f"{prefix}_keys"
-                values_key = f"{prefix}_values"
-                if keys_key not in arrays or values_key not in arrays:
-                    return None
-                k_zd = f"{prefix}_keys_zero_dim"
-                v_zd = f"{prefix}_values_zero_dim"
-                if file_metadata and k_zd in file_metadata:
-                    elements.append(mx.zeros(_decode_shape(file_metadata[k_zd])))
-                else:
-                    elements.append(arrays[keys_key])
-                if file_metadata and v_zd in file_metadata:
-                    elements.append(mx.zeros(_decode_shape(file_metadata[v_zd])))
-                else:
-                    elements.append(arrays[values_key])
-            return ("__nstate__", class_name, elements)
+            return _load_nstate_flat(arrays, file_metadata, prefix, fallback_class)
 
         for i in range(num_layers):
             cache_type = (
@@ -2993,6 +3305,7 @@ class PagedSSDCacheManager(CacheManager):
         layer_cache_types: list[str] | None,
         *,
         turboquant_kv_bits: float | None = None,
+        cachelist_subtypes: dict[str, list[str]] | None = None,
     ) -> bool:
         """Set the live layer-cache signature, replacing stale expectations.
 
@@ -3021,21 +3334,31 @@ class PagedSSDCacheManager(CacheManager):
             old_signature = self._expected_layer_cache_types
             old_canonical = _canonicalize_layer_cache_types(old_signature)
             bits_changed = new_bits != self._expected_turboquant_kv_bits
-            if old_canonical == new_canonical and not bits_changed:
+            subtypes_changed = (
+                cachelist_subtypes != self._expected_cachelist_subtypes
+            )
+            if (
+                old_canonical == new_canonical
+                and not bits_changed
+                and not subtypes_changed
+            ):
                 if old_signature != new_signature:
                     self._expected_layer_cache_types = new_signature
                 return False
 
             self._expected_layer_cache_types = new_signature
             self._expected_turboquant_kv_bits = new_bits
+            self._expected_cachelist_subtypes = cachelist_subtypes
             self._signature_sweep_completed = False
 
         logger.info(
             "PagedSSDCacheManager updated layer cache signature "
-            "(%d layers, %d unique types, turboquant_kv_bits=%s)",
+            "(%d layers, %d unique types, turboquant_kv_bits=%s, "
+            "cachelist_subtypes=%s)",
             len(new_signature),
             len(set(new_canonical or ())),
             new_bits,
+            "yes" if cachelist_subtypes else "no",
         )
         return True
 
@@ -3087,6 +3410,12 @@ class PagedSSDCacheManager(CacheManager):
                     stale.append(h)
                     continue
                 if not self._signature_bits_match(meta.cache_signature):
+                    stale.append(h)
+                    continue
+                if self._expected_cachelist_subtypes is not None and (
+                    _signature_cachelist_subtypes(meta.cache_signature)
+                    != self._expected_cachelist_subtypes
+                ):
                     stale.append(h)
 
         for h in stale:

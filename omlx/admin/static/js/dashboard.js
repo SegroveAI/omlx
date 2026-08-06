@@ -64,7 +64,7 @@
     const DASHBOARD_MAIN_TABS = new Set(['status', 'settings', 'models', 'logs', 'bench']);
     const DASHBOARD_SETTINGS_TABS = new Set(['global', 'integrations', 'models']);
     const DASHBOARD_MODELS_TABS = new Set(['manager', 'downloader', 'quantizer', 'uploader']);
-    const DASHBOARD_BENCH_TABS = new Set(['throughput', 'accuracy']);
+    const DASHBOARD_BENCH_TABS = new Set(['throughput', 'accuracy', 'context']);
 
     // Default sort for the settings and manager model tables. Also the target
     // state for the "reset sort" action.
@@ -94,14 +94,14 @@
                 server: { host: '127.0.0.1', port: 8000, log_level: 'info', sse_keepalive_mode: 'chunk', burst_decode_mode: 'balanced', preserve_mid_system_cache: true },
                 model: { model_dirs: [''], model_fallback: false, hide_helper_models: false },
                 memory: { prefill_memory_guard: true, memory_guard_tier: 'balanced', memory_guard_custom_ceiling_gb: 0 },
-                scheduler: { max_concurrent_requests: 8, embedding_batch_size: 32, chunked_prefill: false },
+                scheduler: { max_concurrent_requests: 8, embedding_batch_size: 32, chunked_prefill: false, prefill_priority: 'context' },
                 cache: { enabled: true, ssd_cache_dir: '', ssd_cache_max_size: 'auto', hot_cache_max_size: '0', initial_cache_blocks: 256, hot_cache_only: false },
                 sampling: { max_context_window: 32768, max_context_window_policy: null, max_tokens: 32768, temperature: 1.0, top_p: 0.95, top_k: 0, repetition_penalty: 1.0 },
                 mcp: { config_path: '' },
                 huggingface: { endpoint: '', hf_cache_enabled: true, hf_cache_path: '' },
                 network: { http_proxy: '', https_proxy: '', no_proxy: '', ca_bundle: '' },
                 auth: { api_key_set: false, api_key: '', skip_api_key_verification: false, sub_keys: [] },
-                claude_code: { context_scaling_enabled: false, target_context_size: 200000, mode: 'cloud', opus_model: null, sonnet_model: null, haiku_model: null },
+                claude_code: { mode: 'cloud', opus_model: null, sonnet_model: null, haiku_model: null },
                 integrations: {
                     copilot_model: null,
                     codex_model: null,
@@ -317,6 +317,7 @@
             hfModelsLoaded: false,
             hfError: '',
             hfSuccess: '',
+            hfTokenInvalid: false,
             _hfRefreshTimer: null,
             hfDeleteConfirm: null,
 
@@ -415,6 +416,7 @@
             oqDtype: 'bfloat16',
             oqSensitivityModelPath: '',
             oqPreserveMtp: false,
+            oqMtpAssistantPath: '',
             oqEnhanced: false,
             oqeReuseImatrixCache: true,
             oqeImatrixCachePath: '',
@@ -446,6 +448,7 @@
 
             // Benchmark state
             benchModelId: '',
+            benchContextProfile: 'code_python',
             benchPromptLengths: { 1024: true, 4096: true, 8192: false, 16384: false, 32768: false, 65536: false, 131072: false, 200000: false },
             benchBatchSizes: { 2: true, 4: true, 8: false },
             benchForceLmEngine: false,
@@ -474,7 +477,8 @@
             benchUploadResults: [],
             benchUploadDone: null,
             benchUploading: false,
-            benchUploadSkipped: null,  // { features: [...] } when upload was skipped due to experimental features
+            benchUploadSkipped: null,  // { reason } — only external-endpoint runs skip now
+            benchUploadFlags: [],      // [{key, label}] acceleration active during the run
             // { bench_id, model_id } when the server reports a running bench
             // that is NOT the one this tab is displaying. Drives the "another
             // bench is running" banner + disables Start so the user doesn't
@@ -484,6 +488,16 @@
             // Bench sub-tab & dropdown
             benchTab: 'throughput',
             benchDropdown: false,
+
+            // Context benchmark state
+            ctxBenchModelId: '',
+            ctxBenchTarget: 131072,
+            ctxBenchRunning: false,
+            ctxBenchBenchId: null,
+            ctxBenchProgress: null,   // { phase, progress, message }
+            ctxBenchResult: null,
+            ctxBenchError: '',
+            ctxBenchEventSource: null,
 
             // Accuracy benchmark state
             accModelId: '',
@@ -537,6 +551,8 @@
             accSamplingProfile: 'deterministic',
             accAdvancedOptionsOpen: false,
             accExternalEnabled: false,
+            // Provider-specific JSON is intentionally session-only.
+            accExternalExtraBody: '',
             accRunning: false,
             accCurrentModel: '',
             accCurrentBenchId: null,
@@ -662,6 +678,7 @@
                     if (!this.benchDeviceInfo) await this.loadBenchDeviceInfo();
                     await this.loadBenchState();
                     await this.loadAccState();
+                    await this.loadCtxBenchState();
                 }
             },
 
@@ -878,6 +895,7 @@
                             max_concurrent_requests: this.globalSettings.scheduler.max_concurrent_requests,
                             embedding_batch_size: this.globalSettings.scheduler.embedding_batch_size,
                             chunked_prefill: this.globalSettings.scheduler.chunked_prefill,
+                            prefill_priority: this.globalSettings.scheduler.prefill_priority,
                             cache_enabled: this.globalSettings.cache.enabled,
                             ssd_cache_dir: this.globalSettings.cache.ssd_cache_dir,
                             ssd_cache_max_size: this.globalSettings.cache.ssd_cache_max_size,
@@ -1119,7 +1137,13 @@
                     if (k === 'chat_template_kwargs' || k === 'forced_ct_kwargs') continue;  // handle below
                     if (isDiffusion && this.isDiffusionUnsupportedProfileField(k)) continue;
                     if (k === 'thinking_budget_enabled') {
-                        if (ms.enableThinkingBudget) out.thinking_budget_tokens = ms.thinking_budget_tokens ?? null;
+                        if (ms.enableThinkingBudget) out.thinking_budget_enabled = true;
+                        continue;
+                    }
+                    if (k === 'thinking_budget_tokens') {
+                        if (ms.enableThinkingBudget && ms.thinking_budget_tokens) {
+                            out.thinking_budget_tokens = Number(ms.thinking_budget_tokens);
+                        }
                         continue;
                     }
                     if (k === 'index_cache_freq') {
@@ -1127,7 +1151,9 @@
                         continue;
                     }
                     if (k === 'max_tool_result_tokens') {
-                        if (ms.enableToolResultLimit) out.max_tool_result_tokens = ms.max_tool_result_tokens || null;
+                        if (ms.enableToolResultLimit && ms.max_tool_result_tokens) {
+                            out.max_tool_result_tokens = Number(ms.max_tool_result_tokens);
+                        }
                         continue;
                     }
                     if (k === 'guided_grammar_enabled') {
@@ -1135,14 +1161,16 @@
                         continue;
                     }
                     if (k === 'guided_grammar') {
-                        out.guided_grammar = ms.guided_grammar_enabled
-                            ? ((ms.guided_grammar || '').trim() || null)
-                            : null;
+                        const g = ms.guided_grammar_enabled ? (ms.guided_grammar || '').trim() : '';
+                        if (g) out.guided_grammar = g;
                         continue;
                     }
-                    // Standard field: apply nullish coalescing; coerce string numerics
-                    let v = ms[k] ?? null;
-                    if (typeof v === 'string' && v !== '' && !isNaN(Number(v))) v = Number(v);
+                    // Standard field: omit unset values entirely — the server
+                    // treats absent universal keys as "reset to default" when
+                    // the profile is applied (snapshot semantics).
+                    let v = ms[k];
+                    if (v === undefined || v === null || v === '') continue;
+                    if (typeof v === 'string' && !isNaN(Number(v))) v = Number(v);
                     out[k] = v;
                 }
 
@@ -1403,6 +1431,23 @@
                     (model) => this.isVlmMtpDraftModel(model),
                     { fallbackToBase: false },
                 );
+            },
+
+            // Settings that materialize as per-request logits processors,
+            // which the VLM MTP decode path cannot apply (#2399). Mirrors
+            // vlm_mtp_processor_conflicts() in model_settings.py; neutral
+            // values (repetition 1.0, presence 0.0) do not conflict.
+            // Thinking budget is exempt: it is applied on the vlm_mtp path
+            // at verify time (MTPProcessingSampler).
+            vlmMtpProcessorConflict() {
+                const ms = this.modelSettings;
+                if (!ms) return false;
+                const num = (v) => (v === null || v === undefined || v === '' ? null : Number(v));
+                const rep = num(ms.repetition_penalty);
+                const pres = num(ms.presence_penalty);
+                return (rep !== null && rep !== 1.0)
+                    || (pres !== null && pres !== 0.0)
+                    || !!ms.guided_grammar_enabled;
             },
 
             buildCtKwargEntries(chatTemplateKwargs, forcedCtKwargs, isDiffusion = false) {
@@ -2395,7 +2440,9 @@
                 parts.push(this.shellEnvAssign('ANTHROPIC_DEFAULT_HAIKU_MODEL', haikuModel));
                 parts.push('API_TIMEOUT_MS=3000000');
                 parts.push('CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1');
-                parts.push('claude');
+                // Deny LSP: its schema joins the tools array mid-session and
+                // re-prefills the whole conversation on a caching server (#2349).
+                parts.push('claude --disallowedTools LSP');
                 return parts.join(' ');
             },
 
@@ -2405,8 +2452,6 @@
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
-                            claude_code_context_scaling_enabled: this.globalSettings.claude_code.context_scaling_enabled,
-                            claude_code_target_context_size: this.globalSettings.claude_code.target_context_size,
                             claude_code_mode: this.globalSettings.claude_code.mode,
                             claude_code_opus_model: this.globalSettings.claude_code.opus_model,
                             claude_code_sonnet_model: this.globalSettings.claude_code.sonnet_model,
@@ -2670,6 +2715,31 @@
                 return String(n);
             },
 
+            formatDFlashSessionStats(totals) {
+                if (!totals || totals.requests <= 1) return '';
+
+                const parts = [];
+                if (totals.speculative_requests > 0) {
+                    parts.push(
+                        Math.round((totals.acceptance_ratio || 0) * 100) + '% ' +
+                        window.t('status.active_models.dflash_draft_share'),
+                        (totals.accepted_draft_tokens_per_cycle || 0).toFixed(2) + ' ' +
+                        window.t('status.active_models.dflash_accepted_draft_per_cycle'),
+                        (totals.tokens_per_cycle || 0).toFixed(2) + ' ' +
+                        window.t('status.active_models.dflash_output_per_cycle'),
+                        totals.speculative_requests + ' ' +
+                        window.t('status.active_models.dflash_speculative_requests'),
+                    );
+                }
+                if (totals.fallback_requests > 0) {
+                    parts.push(
+                        totals.fallback_requests + ' ' +
+                        window.t('status.active_models.dflash_fallback_requests'),
+                    );
+                }
+                return window.t('status.active_models.dflash_session') + ': ' + parts.join(' · ');
+            },
+
             formatDurationShort(seconds) {
                 if (seconds == null || !Number.isFinite(seconds)) return '—';
                 if (seconds < 1) return seconds.toFixed(1) + 's';
@@ -2827,6 +2897,43 @@
                 };
             },
 
+            parseAccuracyExtraBody() {
+                const raw = this.accExternalExtraBody.trim();
+                if (!raw) return {};
+
+                let value;
+                try {
+                    value = JSON.parse(raw);
+                } catch (_) {
+                    throw new Error(window.t('js.error.external_extra_body_invalid_json'));
+                }
+                if (value === null || Array.isArray(value) || typeof value !== 'object') {
+                    throw new Error(window.t('js.error.external_extra_body_object_required'));
+                }
+
+                const protectedFields = new Set([
+                    'model', 'messages', 'stream', 'stream_options',
+                    'max_tokens', 'temperature', 'api_key', 'authorization',
+                ]);
+                const blocked = Object.keys(value).filter(
+                    key => protectedFields.has(key.toLowerCase())
+                );
+                if (blocked.length > 0) {
+                    throw new Error(
+                        window.t('js.error.external_extra_body_protected')
+                            .replace('{fields}', blocked.sort().join(', '))
+                    );
+                }
+                return value;
+            },
+
+            accuracyExternalRequestBody() {
+                const body = this.externalRequestBody();
+                const extraBody = this.parseAccuracyExtraBody();
+                if (Object.keys(extraBody).length > 0) body.extra_body = extraBody;
+                return body;
+            },
+
             // Benchmark functions
             async startBenchmark() {
                 if (this.benchExternalEnabled) {
@@ -2869,6 +2976,7 @@
                 this.benchUploadDone = null;
                 this.benchUploading = false;
                 this.benchUploadSkipped = null;
+                this.benchUploadFlags = [];
                 this.benchRunExternal = this.benchExternalEnabled
                     ? { base_url: this.externalBaseUrl.trim(), model: this.externalModel.trim() }
                     : null;
@@ -2879,6 +2987,7 @@
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
                             model_id: this.benchExternalEnabled ? this.externalModel.trim() : this.benchModelId,
+                            context_profile: this.benchContextProfile,
                             prompt_lengths: promptLengths,
                             generation_length: 128,
                             batch_sizes: batchSizes,
@@ -2935,7 +3044,8 @@
                             // (pp, tg); batch rows by batch_size.
                             if (data.data.test_type === 'single') {
                                 const exists = this.benchSingleResults.some(
-                                    r => r.pp === data.data.pp && r.tg === data.data.tg
+                                    r => this.benchRequestedPp(r) === this.benchRequestedPp(data.data)
+                                        && r.tg === data.data.tg
                                 );
                                 if (!exists) {
                                     this.benchSingleResults = [...this.benchSingleResults, data.data];
@@ -2968,6 +3078,7 @@
                             }
                         } else if (data.type === 'upload_done') {
                             this.benchUploadDone = data.data;
+                            this.benchUploadFlags = data.data.feature_flags || [];
                             this.benchUploading = false;
                             this.benchRunning = false;
                             this.benchProgress = null;
@@ -2975,7 +3086,7 @@
                             this.benchEventSource = null;
                         } else if (data.type === 'upload_skipped') {
                             this.benchUploadSkipped = {
-                                reason: data.reason || 'experimental_features',
+                                reason: data.reason || 'external_endpoint',
                                 features: data.features || [],
                             };
                             this.benchUploading = false;
@@ -3019,10 +3130,237 @@
                 // SSE handler will update state when error/done event arrives
             },
 
+            // Context benchmark functions
+            async startContextBenchmark() {
+                if (!this.ctxBenchModelId || this.ctxBenchRunning) return;
+
+                this.ctxBenchRunning = true;
+                this.ctxBenchProgress = null;
+                this.ctxBenchResult = null;
+                this.ctxBenchError = '';
+                this.ctxBenchBenchId = null;
+
+                try {
+                    const response = await fetch('/admin/api/bench/context/start', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            model_id: this.ctxBenchModelId,
+                            target_tokens: this.ctxBenchTarget,
+                        }),
+                    });
+
+                    if (response.status === 401) {
+                        window.location.href = '/admin';
+                        return;
+                    }
+
+                    if (!response.ok) {
+                        const data = await response.json();
+                        this.ctxBenchError = data.detail || window.t('js.error.start_context_bench_failed');
+                        this.ctxBenchRunning = false;
+                        return;
+                    }
+
+                    const data = await response.json();
+                    this.ctxBenchBenchId = data.bench_id;
+                    this.connectContextBenchSSE(data.bench_id);
+                } catch (err) {
+                    console.error('Failed to start context benchmark:', err);
+                    this.ctxBenchError = window.t('js.error.start_context_bench_failed');
+                    this.ctxBenchRunning = false;
+                }
+            },
+
+            connectContextBenchSSE(benchId) {
+                if (this.ctxBenchEventSource) {
+                    this.ctxBenchEventSource.close();
+                }
+
+                const es = new EventSource(`/admin/api/bench/context/${benchId}/stream`);
+                this.ctxBenchEventSource = es;
+
+                es.onmessage = (event) => {
+                    try {
+                        const data = JSON.parse(event.data);
+
+                        if (data.type === 'progress') {
+                            this.ctxBenchProgress = {
+                                phase: data.phase,
+                                progress: data.progress,
+                                message: data.message,
+                            };
+                        } else if (data.type === 'result') {
+                            this.ctxBenchResult = data.data;
+                        } else if (data.type === 'done') {
+                            this.ctxBenchRunning = false;
+                            this.ctxBenchProgress = null;
+                            es.close();
+                            this.ctxBenchEventSource = null;
+                            // The applied setting changed the model row.
+                            this.loadModels();
+                        } else if (data.type === 'error') {
+                            this.ctxBenchError = data.message;
+                            this.ctxBenchRunning = false;
+                            this.ctxBenchProgress = null;
+                            es.close();
+                            this.ctxBenchEventSource = null;
+                            this.loadModels();
+                        }
+                    } catch (err) {
+                        console.error('Failed to parse SSE event:', err);
+                    }
+                };
+
+                es.onerror = () => {
+                    if (this.ctxBenchRunning) {
+                        this.ctxBenchError = window.t('js.error.benchmark_connection_lost');
+                        this.ctxBenchRunning = false;
+                        this.ctxBenchProgress = null;
+                    }
+                    es.close();
+                    this.ctxBenchEventSource = null;
+                };
+            },
+
+            async cancelContextBenchmark() {
+                if (!this.ctxBenchBenchId) return;
+                try {
+                    await fetch(`/admin/api/bench/context/${this.ctxBenchBenchId}/cancel`, { method: 'POST' });
+                } catch (err) {
+                    console.error('Failed to cancel context benchmark:', err);
+                }
+                // SSE handler will update state when the error event arrives
+            },
+
+            async loadCtxBenchState() {
+                // Attach to an in-flight context bench (page refresh, other tab).
+                try {
+                    const resp = await fetch('/admin/api/bench/context/active');
+                    if (!resp.ok) return;
+                    const data = await resp.json();
+                    if (!data.running || !data.bench_id) return;
+                    if (this.ctxBenchBenchId === data.bench_id && this.ctxBenchEventSource) {
+                        return;
+                    }
+                    this.ctxBenchBenchId = data.bench_id;
+                    this.ctxBenchModelId = data.model_id;
+                    if (data.target_tokens) this.ctxBenchTarget = data.target_tokens;
+                    this.ctxBenchRunning = true;
+                    this.ctxBenchResult = null;
+                    this.ctxBenchError = '';
+                    this.connectContextBenchSSE(data.bench_id);
+                } catch (err) {
+                    console.error('Failed to load context bench state:', err);
+                }
+            },
+
+            ctxBenchCappedByLabel() {
+                const capped = this.ctxBenchResult?.capped_by;
+                if (capped === 'target') return window.t('ctx_bench.capped.target');
+                if (capped === 'native') return window.t('ctx_bench.capped.native');
+                return window.t('ctx_bench.capped.memory');
+            },
+
+            // Native context length of the selected bench model (0 = unknown).
+            ctxBenchNativeLimit() {
+                const m = this.models.find(m => m.id === this.ctxBenchModelId);
+                return (m && m.model_context_length) || 0;
+            },
+
+            // Target presets the selected model can actually reach. Unknown
+            // native -> full list; native below the smallest preset -> keep
+            // the smallest (the server caps the search at native anyway).
+            ctxBenchTargetOptions() {
+                const all = [16384, 32768, 65536, 131072, 262144, 524288];
+                const native = this.ctxBenchNativeLimit();
+                if (!native) return all;
+                const filtered = all.filter(t => t <= native);
+                return filtered.length ? filtered : [all[0]];
+            },
+
+            // Keep the selected target inside the model's reachable presets.
+            ctxBenchClampTarget() {
+                const options = this.ctxBenchTargetOptions();
+                if (!options.includes(this.ctxBenchTarget)) {
+                    this.ctxBenchTarget = options[options.length - 1];
+                }
+            },
+
+            // Narrow-patch save of the global Prefill Priority setting from
+            // the bench tab (mirrors the Settings row; applied live server-side).
+            async saveCtxBenchPriority(value) {
+                if (this.ctxBenchRunning) return;
+                const prev = this.globalSettings.scheduler.prefill_priority;
+                if (prev === value) return;
+                this.globalSettings.scheduler.prefill_priority = value;
+                try {
+                    const resp = await fetch('/admin/api/global-settings', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ prefill_priority: value }),
+                    });
+                    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                } catch (err) {
+                    console.error('Failed to save prefill priority:', err);
+                    this.globalSettings.scheduler.prefill_priority = prev;
+                    this.ctxBenchError = window.t('js.error.save_prefill_priority_failed');
+                }
+            },
+
             benchGetSpeedup(batchResult) {
-                const baseline = this.benchSingleResults.find(r => r.pp === 1024);
-                if (!baseline || !baseline.gen_tps || baseline.gen_tps <= 0) return 0;
+                const baseline = this.benchFindSingle(1024);
+                if (!baseline || !baseline.gen_tps || baseline.gen_tps <= 0) return null;
+                if (batchResult.tg_tps === null || batchResult.tg_tps === undefined) return null;
                 return batchResult.tg_tps / baseline.gen_tps;
+            },
+
+            benchRequestedPp(result) {
+                return result?.requested_pp ?? result?.pp;
+            },
+
+            benchFindSingle(requestedPp) {
+                return this.benchSingleResults.find(
+                    r => this.benchRequestedPp(r) === requestedPp
+                );
+            },
+
+            benchSingleTestLabel(result) {
+                const requested = this.benchRequestedPp(result);
+                const actual = result?.pp;
+                if (requested !== actual) {
+                    return `pp${actual} (requested pp${requested})/tg${result.tg}`;
+                }
+                return `pp${actual}/tg${result.tg}`;
+            },
+
+            benchBatchPromptSummary() {
+                const result = this.benchBatchResults[0];
+                if (!result || result.requested_pp === undefined) {
+                    return window.t('bench.results.batch.subtitle');
+                }
+                const requested = result.requested_pp;
+                const minimum = result.prompt_tokens_min ?? result.pp;
+                const maximum = result.prompt_tokens_max ?? result.pp;
+                const actual = minimum === maximum
+                    ? `actual pp${minimum}`
+                    : `actual pp${minimum}-${maximum}`;
+                return `requested pp${requested} / ${actual} / tg${result.tg}`;
+            },
+
+            // Unmeasured metrics (tpot_ms/gen_tps/tg_tps, plus ttft/pp when
+            // no content delta was ever observed) come through as null
+            // rather than a misleading 0.0 — render them as N/A.
+            benchFmtNum(value, decimals, suffix = '') {
+                if (value === null || value === undefined) return 'N/A';
+                return value.toFixed(decimals) + suffix;
+            },
+
+            // Per-request pp TPS, null when the aggregate itself is unmeasured.
+            benchPpPerReq(batchResult) {
+                const pp = batchResult.pp_tps;
+                if (pp === null || pp === undefined) return null;
+                return pp / batchResult.batch_size;
             },
 
             benchFormatMemory(bytes) {
@@ -3047,6 +3385,7 @@
                     lines.push(`Benchmark Model: ${this.benchModelId}`);
                     lines.push(`Engine: ${this.benchForceLmEngine ? 'Force mlx-lm' : 'Auto'}`);
                 }
+                lines.push(`Context: ${this.benchContextLabel(this.benchContextProfile)}`);
                 lines.push('='.repeat(80));
 
                 // Single Request Results
@@ -3054,15 +3393,15 @@
                     lines.push('');
                     lines.push('Single Request Results');
                     lines.push('-'.repeat(80));
-                    const hdr = [rpad('Test', 16), pad('TTFT(ms)', 10), pad('TPOT(ms)', 10), pad('pp TPS', 12), pad('tg TPS', 12), pad('E2E(s)', 10), pad('Throughput', 12), pad('Peak Mem', 10)];
+                    const hdr = [rpad('Test', 32), pad('TTFT(ms)', 10), pad('TPOT(ms)', 10), pad('pp TPS', 12), pad('tg TPS', 12), pad('E2E(s)', 10), pad('Throughput', 12), pad('Peak Mem', 10)];
                     lines.push(hdr.join('  '));
                     for (const r of this.benchSingleResults) {
                         const row = [
-                            rpad(`pp${r.pp}/tg${r.tg}`, 16),
-                            pad(r.ttft_ms.toFixed(1), 10),
-                            pad(r.tpot_ms.toFixed(2), 10),
-                            pad(r.processing_tps.toFixed(1) + ' tok/s', 12),
-                            pad(r.gen_tps.toFixed(1) + ' tok/s', 12),
+                            rpad(this.benchSingleTestLabel(r), 32),
+                            pad(this.benchFmtNum(r.ttft_ms, 1), 10),
+                            pad(this.benchFmtNum(r.tpot_ms, 2), 10),
+                            pad(this.benchFmtNum(r.processing_tps, 1, ' tok/s'), 12),
+                            pad(this.benchFmtNum(r.gen_tps, 1, ' tok/s'), 12),
                             pad(r.e2e_latency_s.toFixed(3), 10),
                             pad(r.total_throughput.toFixed(1) + ' tok/s', 12),
                             pad(this.benchFormatMemory(r.peak_memory_bytes), 10),
@@ -3074,7 +3413,7 @@
                 // Helper for batch table text
                 const buildBatchText = (title, subtitle, results) => {
                     if (results.length === 0) return;
-                    const baseline = this.benchSingleResults.find(r => r.pp === 1024);
+                    const baseline = this.benchFindSingle(1024);
                     lines.push('');
                     lines.push(`${title}`);
                     lines.push(subtitle);
@@ -3084,24 +3423,24 @@
                     if (baseline) {
                         const row = [
                             rpad('1x', 8),
-                            pad(baseline.gen_tps.toFixed(1) + ' tok/s', 12),
+                            pad(this.benchFmtNum(baseline.gen_tps, 1, ' tok/s'), 12),
                             pad('1.00x', 8),
-                            pad(baseline.processing_tps.toFixed(1) + ' tok/s', 12),
-                            pad(baseline.processing_tps.toFixed(1) + ' tok/s', 12),
-                            pad(baseline.ttft_ms.toFixed(1), 10),
+                            pad(this.benchFmtNum(baseline.processing_tps, 1, ' tok/s'), 12),
+                            pad(this.benchFmtNum(baseline.processing_tps, 1, ' tok/s'), 12),
+                            pad(this.benchFmtNum(baseline.ttft_ms, 1), 10),
                             pad(baseline.e2e_latency_s.toFixed(3), 10),
                         ];
                         lines.push(row.join('  '));
                     }
                     for (const r of results) {
-                        const speedup = baseline && baseline.gen_tps > 0 ? (r.tg_tps / baseline.gen_tps).toFixed(2) + 'x' : '-';
+                        const speedup = this.benchGetSpeedup(r);
                         const row = [
                             rpad(r.batch_size + 'x', 8),
-                            pad(r.tg_tps.toFixed(1) + ' tok/s', 12),
-                            pad(speedup, 8),
-                            pad(r.pp_tps.toFixed(1) + ' tok/s', 12),
-                            pad((r.pp_tps / r.batch_size).toFixed(1) + ' tok/s', 12),
-                            pad(r.avg_ttft_ms.toFixed(1), 10),
+                            pad(this.benchFmtNum(r.tg_tps, 1, ' tok/s'), 12),
+                            pad(speedup !== null ? speedup.toFixed(2) + 'x' : 'N/A', 8),
+                            pad(this.benchFmtNum(r.pp_tps, 1, ' tok/s'), 12),
+                            pad(this.benchFmtNum(this.benchPpPerReq(r), 1, ' tok/s'), 12),
+                            pad(this.benchFmtNum(r.avg_ttft_ms, 1), 10),
                             pad(r.e2e_latency_s.toFixed(3), 10),
                         ];
                         lines.push(row.join('  '));
@@ -3110,7 +3449,7 @@
 
                 buildBatchText(
                     'Continuous Batching',
-                    'pp1024 / tg128',
+                    this.benchBatchPromptSummary(),
                     this.benchBatchResults
                 );
 
@@ -3184,6 +3523,7 @@
                         this.benchOtherActive = {
                             bench_id: data.bench_id,
                             model_id: data.model_id,
+                            context_profile: data.context_profile || 'code_python',
                             force_lm_engine: !!data.force_lm_engine,
                             external: !!data.external,
                         };
@@ -3205,6 +3545,7 @@
             // /api/bench/active. External model ids aren't in the local
             // dropdown, so the external flag drives which controls light up.
             _restoreBenchRunSource(data) {
+                this.benchContextProfile = data.context_profile || 'code_python';
                 if (data.external) {
                     this.benchExternalEnabled = true;
                     this.benchRunExternal = {
@@ -3219,6 +3560,17 @@
                     this.benchExternalEnabled = false;
                     this.benchRunExternal = null;
                 }
+            },
+
+            benchContextLabel(profile) {
+                const keys = {
+                    code_python: 'bench.config.context.code_python',
+                    code_mixed: 'bench.config.context.code_mixed',
+                    novel_ko: 'bench.config.context.novel_ko',
+                    novel_en: 'bench.config.context.novel_en',
+                    novel_ja: 'bench.config.context.novel_ja',
+                };
+                return window.t(keys[profile] || keys.code_python);
             },
 
             // User clicked "View live" on the banner — clear the stale
@@ -3237,6 +3589,7 @@
                 this.benchUploadResults = [];
                 this.benchUploadDone = null;
                 this.benchUploadSkipped = null;
+                this.benchUploadFlags = [];
                 this.benchProgress = null;
                 this.benchError = '';
                 this.connectBenchSSE(other.bench_id);
@@ -3258,6 +3611,13 @@
                 if (tab === 'throughput') {
                     this.loadBenchDeviceInfo();
                     this.loadBenchState();
+                }
+                if (tab === 'context') {
+                    this.loadCtxBenchState();
+                    // The priority segment mirrors the global setting —
+                    // refresh in case it changed on the Settings tab or in
+                    // another window.
+                    this.loadGlobalSettings();
                 }
             },
 
@@ -3305,9 +3665,16 @@
             },
 
             async addToAccQueue() {
+                let externalRequest = null;
                 if (this.accExternalEnabled) {
                     if (!this.externalConfigValid()) {
                         this.accError = window.t('js.error.external_endpoint_required');
+                        return;
+                    }
+                    try {
+                        externalRequest = this.accuracyExternalRequestBody();
+                    } catch (err) {
+                        this.accError = err.message;
                         return;
                     }
                 } else if (!this.accModelId) {
@@ -3332,7 +3699,7 @@
                             batch_size: this.accBatchSize,
                             enable_thinking: this.accExternalEnabled ? false : this.accEnableThinking,
                             sampling_profile: this.accSamplingProfile,
-                            external: this.accExternalEnabled ? this.externalRequestBody() : null,
+                            external: externalRequest,
                         }),
                     });
                     if (!resp.ok) {
@@ -3566,6 +3933,20 @@
                             pad(r.time_s, 10) +
                             pad(r.thinking_used ? 'Yes' : 'No', 8)
                         );
+                        if (r.external) {
+                            lines.push(
+                                `  Valid responses: ${r.valid_response_count}/${r.total}` +
+                                ` (${(r.valid_response_rate * 100).toFixed(1)}%)` +
+                                ` · Valid-answer accuracy: ${(r.valid_answer_accuracy * 100).toFixed(1)}%` +
+                                ` · Empty: ${r.empty_content_count}` +
+                                ` · Truncated: ${r.truncated_count}` +
+                                ` · Timeout: ${r.timeout_count}` +
+                                ` · HTTP: ${r.http_error_count}` +
+                                ` · Connection: ${r.connection_error_count}` +
+                                ` · Invalid: ${r.invalid_response_count}` +
+                                ` · Parse: ${r.parse_error_count}`
+                            );
+                        }
                     }
                 }
 
@@ -3595,7 +3976,7 @@
                 const qr = r.question_results || [];
 
                 if (format === 'json') {
-                    content = JSON.stringify({
+                    const exportData = {
                         model_id: r.model_id,
                         benchmark: r.benchmark,
                         accuracy: r.accuracy,
@@ -3605,13 +3986,43 @@
                         thinking_used: r.thinking_used || false,
                         category_scores: r.category_scores || null,
                         questions: qr,
-                    }, null, 2);
+                    };
+                    if (r.external) {
+                        Object.assign(exportData, {
+                            valid_response_count: r.valid_response_count,
+                            empty_content_count: r.empty_content_count,
+                            truncated_count: r.truncated_count,
+                            timeout_count: r.timeout_count,
+                            http_error_count: r.http_error_count,
+                            connection_error_count: r.connection_error_count,
+                            invalid_response_count: r.invalid_response_count,
+                            parse_error_count: r.parse_error_count,
+                            wrong_count: r.wrong_count,
+                            valid_response_rate: r.valid_response_rate,
+                            valid_answer_accuracy: r.valid_answer_accuracy,
+                            reliability_warning: r.reliability_warning,
+                        });
+                    }
+                    content = JSON.stringify(exportData, null, 2);
                     mime = 'application/json';
                 } else if (format === 'csv') {
                     const esc = s => '"' + (s || '').replace(/"/g, '""') + '"';
-                    const lines = ['id,category,correct,expected,predicted,question,raw_response,time_s'];
+                    const lines = [r.external
+                        ? 'id,category,status,correct,expected,predicted,finish_reason,reasoning_fields,prompt_tokens,completion_tokens,error_message,question,raw_response,time_s'
+                        : 'id,category,correct,expected,predicted,question,raw_response,time_s'];
                     for (const q of qr) {
-                        lines.push([q.id, esc(q.category || ''), q.correct, esc(q.expected), esc(q.predicted), esc(q.question), esc(q.raw_response), q.time_s].join(','));
+                        if (r.external) {
+                            lines.push([
+                                q.id, esc(q.category || ''), esc(q.status || ''), q.correct,
+                                esc(q.expected), esc(q.predicted), esc(q.finish_reason || ''),
+                                esc((q.reasoning_fields_nonempty || []).join('|')),
+                                q.prompt_tokens || 0, q.completion_tokens || 0,
+                                esc(q.error_message || ''), esc(q.question),
+                                esc(q.raw_response), q.time_s,
+                            ].join(','));
+                        } else {
+                            lines.push([q.id, esc(q.category || ''), q.correct, esc(q.expected), esc(q.predicted), esc(q.question), esc(q.raw_response), q.time_s].join(','));
+                        }
                     }
                     content = lines.join('\n');
                     mime = 'text/csv';
@@ -3623,9 +4034,20 @@
                         `Time: ${r.time_s}s`,
                         '',
                     ];
+                    if (r.external) {
+                        lines.splice(4, 0,
+                            `Valid responses: ${r.valid_response_count}/${r.total} (${(r.valid_response_rate * 100).toFixed(1)}%)`,
+                            `Valid-answer accuracy: ${(r.valid_answer_accuracy * 100).toFixed(1)}%`,
+                            `Empty: ${r.empty_content_count}; Truncated: ${r.truncated_count}; Timeout: ${r.timeout_count}; HTTP errors: ${r.http_error_count}; Connection errors: ${r.connection_error_count}; Invalid responses: ${r.invalid_response_count}; Parse errors: ${r.parse_error_count}`
+                        );
+                    }
                     for (const q of qr) {
-                        lines.push(`--- Q${q.id} [${q.correct ? 'CORRECT' : 'WRONG'}] ---`);
+                        const label = r.external ? (q.status || 'invalid_response').toUpperCase() : (q.correct ? 'CORRECT' : 'WRONG');
+                        lines.push(`--- Q${q.id} [${label}] ---`);
                         if (q.category) lines.push(`Category: ${q.category}`);
+                        if (r.external && q.finish_reason) lines.push(`Finish reason: ${q.finish_reason}`);
+                        if (r.external && (q.reasoning_fields_nonempty || []).length) lines.push(`Reasoning fields: ${q.reasoning_fields_nonempty.join(', ')}`);
+                        if (r.external && q.error_message) lines.push(`Error: ${q.error_message}`);
                         lines.push(`Question: ${q.question || ''}`);
                         lines.push(`Expected: ${q.expected}`);
                         lines.push(`Predicted: ${q.predicted}`);
@@ -3664,9 +4086,11 @@
                 const LEVELS = ['TRACE', 'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'];
                 const idx = LEVELS.indexOf(lvl);
                 const minIdx = LEVELS.indexOf(this.logMinLevel);
+                // Levels at or above the minimum are all shown dark so the
+                // included range is obvious; the selected minimum keeps the ring.
                 if (idx < minIdx) return 'bg-neutral-100 text-neutral-300';
                 if (idx === minIdx) return 'bg-neutral-900 text-white';
-                return 'bg-neutral-200 text-neutral-700';
+                return 'bg-neutral-700 text-white';
             },
 
             async loadLogs() {
@@ -3879,11 +4303,16 @@
                 const bold = (gb) => `<strong>${fmt(gb)} GB</strong>`;
 
                 // Static / metal cap for the final clamp shown to the user.
+                // The small-system threshold must track
+                // ProcessMemoryEnforcer._SMALL_SYSTEM_THRESHOLD (24 GB): under
+                // it the server reserves a flat 4 GB regardless of tier. This
+                // read 16 and so understated the static ceiling by up to 4 GB
+                // on every 16-23 GB Mac.
                 const totalGB = (sys.total_memory_bytes || 0) / GB;
                 const staticReserveGB =
                     tier === 'custom'
                         ? 2
-                        : totalGB < 16
+                        : totalGB < 24
                             ? 4
                             : { safe: 8, balanced: 6, aggressive: 4 }[tier] ?? 6;
                 const staticCeiling = Math.max(0, totalGB - staticReserveGB);
@@ -4486,6 +4915,8 @@
                         text_only: this.oqTextOnly,
                         dtype: this.oqDtype,
                         preserve_mtp: this.oqSelectedModelHasMtp() ? this.oqPreserveMtp : false,
+                        mtp_assistant_model_path: this.oqMtpAssistantCandidates().some(m => m.path === this.oqMtpAssistantPath)
+                            ? this.oqMtpAssistantPath : '',
                     };
                     if (this.oqEnhanced) {
                         payload.enhanced = true;
@@ -4594,6 +5025,43 @@
                     m.is_quantized &&
                     m.model_type === source.model_type
                 );
+            },
+
+            oqMtpAssistantCandidates() {
+                // Gemma 4 ships its MTP head as a separate gemma4_assistant
+                // checkpoint; offer to merge it into the quantized output.
+                // Qwen3.5/3.6 recipients can instead graft the native mtp.*
+                // head out of a same-geometry donor checkpoint (e.g. the
+                // base model of a fine-tune). Loose filter here; strict
+                // tokenizer/geometry validation happens server-side at
+                // submit.
+                if (!this.oqSelectedModelPath) return [];
+                const source = this.oqModels.find(m => m.path === this.oqSelectedModelPath);
+                if (!source) return [];
+                if (source.model_type === 'gemma4') {
+                    return this.oqAllModels.filter(m => m.model_type === 'gemma4_assistant');
+                }
+                const family = this.oqMtpFamily(source.model_type);
+                if (!family) return [];
+                if (this.oqSelectedModelHasMtp() && this.oqPreserveMtp) return [];
+                return this.oqAllModels.filter(m =>
+                    m.path !== source.path &&
+                    m.has_mtp_heads &&
+                    this.oqMtpFamily(m.model_type) === family &&
+                    (!m.hidden_size || !source.hidden_size || m.hidden_size === source.hidden_size)
+                );
+            },
+
+            oqMtpFamily(modelType) {
+                if (!modelType) return null;
+                if (modelType.startsWith('qwen3_6')) return 'qwen3_6';
+                if (modelType.startsWith('qwen3_5')) return 'qwen3_5';
+                return null;
+            },
+
+            oqSelectedModelType() {
+                const model = this.oqModels.find(m => m.path === this.oqSelectedModelPath);
+                return model?.model_type || '';
             },
 
             oqLevelLabel(level) {
@@ -4829,6 +5297,7 @@
                     const response = await fetch(`/admin/api/hf/recommended?mlx_only=${this.hfMlxOnly}`, { signal: controller.signal });
                     if (response.ok) {
                         const data = await response.json();
+                        this.hfTokenInvalid = !!data.hf_token_invalid;
                         // Attach original rank so the # column survives column-header re-sorts
                         this.hfRecommended = {
                             trending: (data.trending || []).map((m, i) => ({ ...m, rank: i + 1 })),
@@ -4995,6 +5464,7 @@
                     const response = await fetch(`/admin/api/hf/search?${params}`, { signal: controller.signal });
                     if (response.ok) {
                         const data = await response.json();
+                        this.hfTokenInvalid = !!data.hf_token_invalid;
                         this.hfSearchResults = data.models || [];
                         this.hfSearchLoaded = true;
                         // Save to search history

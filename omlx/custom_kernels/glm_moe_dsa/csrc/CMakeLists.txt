@@ -34,6 +34,8 @@ target_sources(
   PRIVATE
   ${CMAKE_CURRENT_LIST_DIR}/dsa_indexer.cpp
   ${CMAKE_CURRENT_LIST_DIR}/deepseek_v4_sparse_attention.cpp
+  ${CMAKE_CURRENT_LIST_DIR}/dspark_gemm.cpp
+  ${CMAKE_CURRENT_LIST_DIR}/dspark_qmv.cpp
   ${CMAKE_CURRENT_LIST_DIR}/exact_block_attention.cpp
   ${CMAKE_CURRENT_LIST_DIR}/fused_moe.cpp
   ${CMAKE_CURRENT_LIST_DIR}/sparse_mla.cpp)
@@ -50,6 +52,8 @@ if(MLX_BUILD_METAL)
   set(OMLX_GLM_METAL_SOURCES
       ${CMAKE_CURRENT_LIST_DIR}/deepseek_moe.metal
       ${CMAKE_CURRENT_LIST_DIR}/deepseek_v4_sparse_attention.metal
+      ${CMAKE_CURRENT_LIST_DIR}/dspark_gemm.metal
+      ${CMAKE_CURRENT_LIST_DIR}/dspark_qmv.metal
       ${CMAKE_CURRENT_LIST_DIR}/dsa_indexer.metal
       ${CMAKE_CURRENT_LIST_DIR}/exact_block_attention.metal
       ${CMAKE_CURRENT_LIST_DIR}/fused_moe.metal
@@ -108,6 +112,7 @@ if(MLX_BUILD_METAL)
   add_custom_target(omlx_glm_kernels_metallib DEPENDS ${OMLX_GLM_METALLIB})
 
   add_dependencies(omlx_glm_kernel_ops omlx_glm_kernels_metallib)
+
 endif()
 
 nanobind_add_module(
@@ -122,5 +127,11 @@ nanobind_add_module(
 target_link_libraries(_ext PRIVATE omlx_glm_kernel_ops)
 
 if(BUILD_SHARED_LIBS)
-  target_link_options(_ext PRIVATE -Wl,-rpath,@loader_path)
+  # @loader_path resolves the sibling kernel_ops dylib. The second entry
+  # resolves the mlx wheel's libmlx.dylib from the installed site-packages
+  # layout (omlx/custom_kernels/<pkg> -> site-packages -> mlx/lib); without
+  # it the only libmlx rpath is the link-time absolute path into the build
+  # env, which is dead after install (issue #2233).
+  target_link_options(_ext PRIVATE -Wl,-rpath,@loader_path
+                      -Wl,-rpath,@loader_path/../../../mlx/lib)
 endif()

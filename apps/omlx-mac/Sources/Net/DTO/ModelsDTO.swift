@@ -23,6 +23,8 @@ struct ModelDTO: Codable, Equatable, Sendable, Identifiable {
     let isLoading: Bool
     let estimatedSize: Int64
     let estimatedSizeFormatted: String?
+    let actualSize: Int64?
+    let actualSizeFormatted: String?
     let pinned: Bool?
     let isDefault: Bool?
     let isFavorite: Bool?
@@ -31,6 +33,9 @@ struct ModelDTO: Codable, Equatable, Sendable, Identifiable {
     /// Lower-level config-derived model class (e.g. `deepseek_v32`,
     /// `glm_moe_dsa`). Used to gate the IndexCache row to DSA models.
     let configModelType: String?
+    /// Native context window from the model's config.json. The Context
+    /// Bench target selector hides presets beyond it.
+    let modelContextLength: Int?
     /// Server-side default for `enable_thinking` derived from the model
     /// (chat template, config). UI shows it as the inherited value when
     /// `enable_thinking` is unset and offers a one-click reset to it.
@@ -47,7 +52,21 @@ struct ModelDTO: Codable, Equatable, Sendable, Identifiable {
     /// True when the model is structurally compatible with native MTP.
     let mtpCompatible: Bool?
     let mtpCompatibilityReason: String?
+    /// True for builtin virtual entries (e.g. the MarkItDown document
+    /// converter) that have no real load/unload lifecycle.
+    let virtual: Bool?
     let settings: ModelSettingsDTO?
+}
+
+extension ModelDTO {
+    /// Single size figure for compact UI: the observed footprint once the
+    /// model has settled, the estimate while loading or before one exists.
+    var sizeLabel: String {
+        if isLoading {
+            return estimatedSizeFormatted ?? ""
+        }
+        return actualSizeFormatted ?? estimatedSizeFormatted ?? ""
+    }
 }
 
 struct ModelSettingsDTO: Codable, Equatable, Sendable {

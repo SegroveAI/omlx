@@ -599,6 +599,45 @@ class TestRotatingKVCacheHandlerWithMLX:
         assert isinstance(cache, PrefillReadyRotatingKVCache)
         assert cache.size() == 100
 
+    def test_reconstruct_cache_missing_meta_and_fields_rejected(self, handler, mx):
+        """No meta_state and no explicit window fields: reject, don't guess.
+
+        A restored rotating layer whose meta never round-tripped used to be
+        rebuilt with keep=0, max_size=keys.shape[2], offset=keys.shape[2]
+        guessed from the buffer shape. Once the window has rotated, the true
+        offset exceeds the buffer length, so the guess silently shifts RoPE
+        positions for every subsequent token and shrinks the window. The
+        handler must return None so the caller rejects the cached prefix and
+        the request re-prefills.
+        """
+        state = {
+            "keys": mx.zeros((1, 8, 256, 64)),
+            "values": mx.zeros((1, 8, 256, 64)),
+            "meta_state": None,
+        }
+
+        assert handler.reconstruct_cache(state, None) is None
+
+    def test_reconstruct_cache_explicit_state_fields_without_meta(self, handler, mx):
+        """Live-path states carry keep/max_size/offset explicitly (extract_state,
+        slice_state, concatenate_states all emit them); those must keep
+        reconstructing without a meta_state tuple."""
+        state = {
+            "keys": mx.zeros((1, 8, 256, 64)),
+            "values": mx.zeros((1, 8, 256, 64)),
+            "keep": 4,
+            "max_size": 256,
+            "offset": 500,
+            "_idx": 100,
+        }
+
+        cache = handler.reconstruct_cache(state, None)
+
+        assert cache is not None
+        assert cache.keep == 4
+        assert cache.max_size == 256
+        assert cache.offset == 500
+
     def test_reconstruct_cache_oversized_trims_to_max_size(self, handler, mx):
         """Oversized prefill-internal snapshot is trimmed to max_size.
 
@@ -678,6 +717,19 @@ class TestArraysCacheHandler:
         result = handler.concatenate_states(states)
 
         assert result["states"] == [3, 4, 5]
+
+    def test_deserialize_state_preserves_all_slots(self, handler):
+        """Variable-length state must not be dropped by fixed-axis decoding."""
+        import mlx.core as mx
+
+        elements = tuple(mx.full((1,), i) for i in range(4))
+
+        restored = handler.deserialize_state(elements)
+
+        assert isinstance(restored, SizedArraysCache)
+        assert len(restored.state) == 4
+        for expected, actual in zip(elements, restored.state):
+            assert mx.array_equal(expected, actual).item()
 
     def test_state_keys(self, handler):
         """Test state keys."""

@@ -30,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import os
 import subprocess
 import time
 from contextlib import suppress
@@ -38,6 +39,7 @@ from typing import TYPE_CHECKING, Any
 import mlx.core as mx
 
 from . import settings as _settings
+from .engine.base import BaseNonStreamingEngine
 from .utils import psutil_compat
 from .utils.proc_memory import get_phys_footprint
 
@@ -122,10 +124,11 @@ def get_macos_vm_stats() -> dict[str, int] | None:
     call so this is safe inside the enforcer poll loop and inside
     per-chunk memcheck.
 
-    The dict exposes only the first four page counters we use for the
-    dynamic ceiling math. Those counters are stable at the front of
-    `vm_statistics64`; using a max-sized `host_info64_t` buffer avoids
-    pinning oMLX to an SDK-specific tail layout.
+    The dict always exposes the first four page counters used by the dynamic
+    ceiling math. Those counters are stable at the front of `vm_statistics64`;
+    speculative and compressed counters are included when the kernel fills the
+    relevant tail fields. A max-sized `host_info64_t` buffer avoids pinning
+    oMLX to an SDK-specific tail layout.
     """
     return psutil_compat.get_macos_vm_stats()
 
@@ -382,6 +385,10 @@ class ProcessMemoryEnforcer:
         # admission control. Updated on every poll iteration.
         self._pressure_level: str = "ok"
         self._over_ceiling_polls: int = 0
+        # Consecutive hard-pressure polls we have deferred the busy-request
+        # abort while a fat Metal buffer pool drains at the next prefill
+        # chunk / step boundary. See the grace check in _check_and_enforce.
+        self._busy_abort_grace_polls: int = 0
         # Last value passed to mx.set_wired_limit (0 if not yet applied
         # or the call failed). Used by the admin dashboard to surface a
         # warning when the kernel iogpu.wired_limit_mb is below this.
@@ -659,6 +666,60 @@ class ProcessMemoryEnforcer:
     def get_final_ceiling(self) -> int:
         """Public accessor used by engine_pool pre-load admission."""
         return self._get_hard_limit_bytes()
+
+    def get_ceiling_breakdown(self) -> dict[str, int]:
+        """Public accessor for the component ceilings.
+
+        The engine pool reads this when a load is refused so the error can
+        name the binding constraint, the same way the scheduler's
+        prefill-rejection message does from its propagated copies.
+        """
+        return self._get_ceiling_breakdown()
+
+    def get_admission_ceiling(self) -> int:
+        """Best-effort pre-load ceiling that survives disabling the guard.
+
+        ``get_final_ceiling()`` returns 0 when the prefill memory guard is
+        off, which used to disable engine-pool pre-load eviction entirely:
+        loading a second model would overcommit physical memory and thrash
+        the machine instead of evicting the LRU model (#2290). This
+        accessor keeps load-time eviction working independently of the
+        guard toggle by falling back to the static ceiling (total RAM
+        minus the tier reserve) when the guard is disabled.
+
+        The Metal cap and the dynamic (vm_stat) ceiling are deliberately
+        excluded from the fallback: with the guard off nothing is wired,
+        allocations beyond Apple's recommended working set stay pageable,
+        and workloads legitimately run above that cap. The engine pool
+        treats this fallback as best-effort — it evicts idle LRU models to
+        fit under it but never refuses a load, preserving the unguarded
+        "no hard limits" semantics.
+        """
+        if self._prefill_memory_guard:
+            return self._get_hard_limit_bytes()
+        return self._get_static_ceiling()
+
+    def get_admission_soft_target(self) -> int:
+        """Soft watermark that pre-load admission evicts down to (#2319).
+
+        The admission check used to evict idle models only when the
+        projected total exceeded the final ceiling, while every other
+        pressure mechanism (pressure levels, prefill-headroom eviction)
+        targets the soft watermark. A second model admitted into the
+        soft..ceiling band kept both models resident through the load,
+        pushing the process into hard-pressure swap until the first
+        request's prefill guard finally evicted the old one. Exposing the
+        soft watermark lets the engine pool evict idle LRU models down to
+        the same target *before* the new weights start allocating; load
+        refusal stays governed by the admission ceiling.
+
+        Returns 0 when no ceiling is available (callers fall back to
+        ceiling-only admission).
+        """
+        ceiling = self.get_admission_ceiling()
+        if ceiling <= 0:
+            return 0
+        return int(ceiling * self._soft_threshold)
 
     def _get_abort_limit_bytes(self) -> int:
         """Stable physical cap used to ABORT an in-flight prefill.
@@ -944,6 +1005,62 @@ class ProcessMemoryEnforcer:
             )
         return freed_total
 
+    # Pool bytes below which a pressure-triggered clear is not worth the
+    # per-clear IOGPUFamily refcount cost (matches the scheduler's own
+    # _periodic_clear_threshold_bytes floor). Above it, a clear meaningfully
+    # returns memory to the OS.
+    _POOL_RECLAIM_FLOOR = 2 * 1024**3
+    # Max consecutive hard-pressure polls the busy-request abort is deferred
+    # while a reclaimable pool drains. Prefill chunks run ~5s at full step
+    # size, so 5 one-second polls cover at least one chunk boundary.
+    _BUSY_ABORT_GRACE_POLLS_MAX = 5
+
+    def _pool_bytes(self) -> int:
+        """MLX buffer-pool size, 0 when unreadable (mocked mx in tests)."""
+        try:
+            return int(mx.get_cache_memory())
+        except (TypeError, ValueError):
+            return 0
+
+    def _request_scheduler_cache_reclaim(self, freed_hot: int) -> None:
+        """Ask each scheduler to run its step-boundary Metal cache clear.
+
+        Routes the reclaim through the scheduler's shipped, lock-protected,
+        engine-stream-synchronized ``_sync_and_clear_cache`` path (the same
+        one the periodic clear uses) instead of touching Metal from the
+        enforcer thread — the enforcer must never touch Metal directly.
+        Setting the per-scheduler flag is GIL-atomic; the actual clear fires
+        on the inference thread at the next step boundary, even under load —
+        unlike ``request_idle_reclaim``, which never fires while requests are
+        running and so cannot recover a busy server from hard pressure.
+
+        Fires when a hot-cache shrink just freed references (so the freed
+        buffers, now pooled, can be returned to the OS) OR when the MLX
+        buffer pool alone holds a meaningful amount under pressure (the
+        already-wedged case where hot cache is empty but pooled buffers are
+        stranded).
+        """
+        # A non-numeric reading (e.g. a wholesale-mocked mx in unit tests)
+        # cannot justify a clear; _pool_bytes treats it as an empty pool.
+        pool_bytes = self._pool_bytes()
+        if freed_hot <= 0 and pool_bytes <= self._POOL_RECLAIM_FLOOR:
+            return
+        requested = 0
+        for entry in self._engine_pool._entries.values():
+            scheduler = self._resolve_scheduler(entry)
+            request = getattr(scheduler, "request_pressure_reclaim", None)
+            if callable(request):
+                request()
+                requested += 1
+        if requested:
+            logger.info(
+                "Requested pressure cache reclaim on %d scheduler(s) "
+                "(freed_hot=%s, pool=%s)",
+                requested,
+                _format_gb(freed_hot),
+                _format_gb(pool_bytes),
+            )
+
     def get_pressure_level(self) -> str:
         """Return cached pressure level: 'ok', 'soft', or 'hard'.
 
@@ -1009,11 +1126,24 @@ class ProcessMemoryEnforcer:
         hot_cache_reserved = (
             self._hot_cache_reserved_bytes() if ceiling > 0 or abort_limit > 0 else 0
         )
+        # Clamp to the reservation: the usage-side exclusion must never exceed
+        # what the ceiling actually gave up, or a transient hot-cache overshoot
+        # past max_bytes would net-weaken the guard exactly under pressure.
+        hot_cache_used = (
+            min(self._hot_cache_used_bytes(), hot_cache_reserved)
+            if hot_cache_reserved > 0
+            else 0
+        )
         scheduler_ceiling = self._scheduler_limit_bytes(
             ceiling, reserved=hot_cache_reserved
         )
         soft_limit = (
             int(scheduler_ceiling * self._soft_threshold)
+            if scheduler_ceiling > 0
+            else 0
+        )
+        hard_watermark = (
+            int(scheduler_ceiling * self._hard_threshold)
             if scheduler_ceiling > 0
             else 0
         )
@@ -1045,6 +1175,12 @@ class ProcessMemoryEnforcer:
                     continue
                 if getattr(engine, "is_diffusion_model", False):
                     continue
+                if isinstance(engine, BaseNonStreamingEngine):
+                    # TTS/STT/STS/Embedding/Reranker engines run on the MLX
+                    # executor without a Scheduler, so an unresolvable
+                    # scheduler is their normal shape, not a wrapper break.
+                    # Warning here reads as a guard regression (#2312).
+                    continue
                 # Silent no-op was the failure mode that originally hid
                 # the dead memory guard: a wrapper-chain change made
                 # ``_resolve_scheduler()`` return None on a loaded engine
@@ -1066,6 +1202,7 @@ class ProcessMemoryEnforcer:
                 continue
             scheduler._memory_limit_bytes = soft_limit
             scheduler._memory_hard_limit_bytes = scheduler_ceiling
+            scheduler._memory_hard_watermark_bytes = hard_watermark
             scheduler._memory_abort_limit_bytes = scheduler_abort_limit
             scheduler._prefill_abort_margin = self._get_prefill_abort_margin()
             # Propagate the component ceilings too so the rejection
@@ -1077,12 +1214,22 @@ class ProcessMemoryEnforcer:
             scheduler._memory_dynamic_ceiling_bytes = breakdown["dynamic"]
             scheduler._memory_metal_cap_bytes = breakdown["metal_cap"]
             scheduler._memory_hot_cache_reserved_bytes = hot_cache_reserved
+            # Usage-side counterpart of the reservation above: targets whose
+            # usage read is raw phys_footprint (the DFlash primary guard)
+            # subtract this so serialized hot-cache CPU bytes are not charged
+            # both here and in the reserved ceiling. The Scheduler reads its
+            # own live counter instead and ignores this attr.
+            scheduler._memory_hot_cache_used_bytes = hot_cache_used
             # Tier name disambiguates dynamic = computed reclaimable
             # (safe/balanced/aggressive) from dynamic = user-pinned
             # custom_ceiling_bytes (custom). The advice ladder needs
             # the distinction to point at the right knob.
             scheduler._memory_guard_tier = self._memory_guard_tier
             scheduler._prefill_memory_guard = self._prefill_memory_guard
+            # Marks the guard state as trustworthy: until this is set the
+            # sdpa256 route treats _prefill_memory_guard=False as "unknown"
+            # and keeps its memory-safe tiled default (#2283).
+            scheduler._memory_limits_propagated = True
             scheduler._admission_paused = admission_paused
             scheduler._prefill_headroom_safety = self._prefill_headroom_safety
             scheduler._prefill_safe_zone_ratio = self._prefill_safe_zone_ratio
@@ -1289,6 +1436,12 @@ class ProcessMemoryEnforcer:
         else:
             new_level = "hard"
 
+        if new_level != "hard":
+            # The hard episode ended (drain worked or the load finished):
+            # the next one gets a fresh abort-grace budget. Must happen
+            # before the ok-level early return below.
+            self._busy_abort_grace_polls = 0
+
         if new_level != prev_level:
             self._pressure_level = new_level
             self._propagate_memory_limit()
@@ -1305,6 +1458,15 @@ class ProcessMemoryEnforcer:
                 current,
                 soft,
             )
+            # Return reclaimable Metal memory to the OS. The shrink above only
+            # drops mx.array references into MLX's buffer-cache pool, which is
+            # pinned by set_cache_limit(total) (the #300 panic guard), so the
+            # freed bytes never leave the process and phys_footprint does not
+            # drop — the enforcer then wrongly concludes "no evictable models"
+            # and livelocks until restart. Env gate
+            # OMLX_DISABLE_PRESSURE_RECLAIM=1 restores stock behavior.
+            if os.environ.get("OMLX_DISABLE_PRESSURE_RECLAIM") != "1":
+                self._request_scheduler_cache_reclaim(freed_hot)
             if freed_hot > 0:
                 current = self._current_usage_bytes()
                 emergency = self._is_emergency_pressure(current, ceiling)
@@ -1384,6 +1546,33 @@ class ProcessMemoryEnforcer:
                 if new_level == "hard":
                     busy_victim = self._find_lru_busy_non_pinned_victim_locked()
                     if busy_victim is not None:
+                        # Reclaim-before-abort grace: when the MLX buffer pool
+                        # alone holds more than the reclaim floor, the pressure
+                        # clear requested above can very likely recover below
+                        # the watermark without killing anything (measured:
+                        # aborts fired 0.1GB over the watermark with 3.7GB of
+                        # pooled buffers on the table). The drain runs on the
+                        # inference thread at the next prefill-chunk or step
+                        # boundary, so give it a bounded number of polls.
+                        # Never defers an emergency (at/over the ceiling).
+                        if (
+                            not emergency
+                            and self._busy_abort_grace_polls
+                            < self._BUSY_ABORT_GRACE_POLLS_MAX
+                            and self._pool_bytes() > self._POOL_RECLAIM_FLOOR
+                        ):
+                            self._busy_abort_grace_polls += 1
+                            logger.info(
+                                "Hard memory pressure on '%s': deferring "
+                                "request abort (poll %d/%d) while %s of "
+                                "pooled Metal buffers drain",
+                                busy_victim,
+                                self._busy_abort_grace_polls,
+                                self._BUSY_ABORT_GRACE_POLLS_MAX,
+                                _format_gb(self._pool_bytes()),
+                            )
+                            break
+                        self._busy_abort_grace_polls = 0
                         entry = self._engine_pool._entries.get(busy_victim)
                         aborted = 0
                         if (
@@ -1495,6 +1684,10 @@ class ProcessMemoryEnforcer:
             post_level = "hard"
         if post_ceiling <= 0 or post_current < post_ceiling:
             self._over_ceiling_polls = 0
+        if post_level != "hard":
+            # Same reset as the pre-action check: eviction inside this tick
+            # may already have ended the hard episode.
+            self._busy_abort_grace_polls = 0
         if post_level != self._pressure_level:
             self._pressure_level = post_level
             self._propagate_memory_limit()

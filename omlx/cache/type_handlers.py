@@ -189,7 +189,7 @@ class CacheTypeHandler(ABC):
     #
     # The legacy interface (extract_state/reconstruct_cache with a dict
     # of "keys"/"values") only models 2-tuple state. mlx-lm caches like
-    # BatchKVCache (4-tuple) and DeepSeek V4's PoolingCache (3-tuple)
+    # BatchKVCache (4-tuple) and DeepSeek V4's PoolingCache (5-tuple)
     # carry more elements that omlx core needs to preserve through the
     # prefix-cache, boundary-snapshot, and SSD round-trip without
     # silently dropping elements past index 1.
@@ -254,7 +254,7 @@ class CacheTypeHandler(ABC):
         Default behavior maps elements to the legacy ``keys``/``values``
         dict by zipping with ``get_state_axis_info()`` names, then calls
         ``reconstruct_cache``. Handlers whose state cannot be expressed
-        as ``(keys, values)`` (e.g. PoolingCacheHandler with 3 elements)
+        as ``(keys, values)`` (e.g. PoolingCacheHandler with 5 elements)
         should override this method.
         """
         axis_info = self.get_state_axis_info()
@@ -560,9 +560,25 @@ class RotatingKVCacheHandler(CacheTypeHandler):
         if meta_state and len(meta_state) >= 4:
             keep, max_size, offset, _idx_unused = map(int, meta_state[:4])
         else:
-            keep = state.get("keep", 0)
-            max_size = state.get("max_size", keys.shape[2])
-            offset = state.get("offset", keys.shape[2])
+            # Live-path states carry the window fields explicitly
+            # (extract_state / slice_state / concatenate_states all emit
+            # them). A restored state without them and without meta_state
+            # has unknown window geometry: guessing offset/max_size from
+            # the buffer shape silently shifts RoPE positions once the
+            # window has rotated (true offset > buffer length) and shrinks
+            # the window. Reject so the caller re-prefills instead.
+            keep = state.get("keep")
+            max_size = state.get("max_size")
+            offset = state.get("offset")
+            if keep is None or max_size is None or offset is None:
+                logger.warning(
+                    "RotatingKVCache reconstruction is missing meta_state "
+                    "and explicit window fields (keep/max_size/offset). "
+                    "Rejecting the cached state instead of guessing the "
+                    "window geometry from the buffer shape."
+                )
+                return None
+            keep, max_size, offset = int(keep), int(max_size), int(offset)
 
         # Trim oversized prefill-internal snapshots back to max_size.
         # Boundary snapshots can hold seq_len = max_size + chunk_size - 1
@@ -796,6 +812,17 @@ class ArraysCacheHandler(CacheTypeHandler):
             return {}
         # Use latest state
         return states[-1]
+
+    def deserialize_state(
+        self,
+        elements: tuple[Any, ...],
+        meta_state: Any | None = None,
+    ) -> Any:
+        """Reconstruct every element of a variable-length ArraysCache state."""
+        return self.reconstruct_cache(
+            {"states": list(elements)},
+            meta_state,
+        )
 
     def reconstruct_cache(
         self,

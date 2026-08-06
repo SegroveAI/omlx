@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 _PATCHED = False
 _LINEAR_PATCHED = False
 _LM_LINEAR_PATCHED = False
-_SUPPORTED_QMM_BITS = frozenset((4, 5, 6, 8))
+_SUPPORTED_QMM_BITS = frozenset((2, 4, 5, 6, 8))
 _Q8_MIN_TOKENS = 16384
 
 
@@ -37,6 +37,14 @@ def _native_qmm_for_bits(bits: int) -> Callable[..., mx.array] | None:
     if bits not in _SUPPORTED_QMM_BITS or not fast.has_symbol(name):
         return None
     return getattr(fast, name)
+
+
+def _qmm_supports_group_size(group_size: int) -> bool:
+    try:
+        from omlx.custom_kernels.qwen35_prefill import fast
+    except Exception:
+        return False
+    return fast.qmm_supports_group_size(group_size)
 
 
 def _has_native_qmm() -> bool:
@@ -56,7 +64,10 @@ def _is_supported_affine_linear_shape(
         return False
     if ndim < 2 or seq_len <= 1:
         return False
-    if getattr(linear, "group_size", None) != 64:
+    group_size = getattr(linear, "group_size", None)
+    if group_size not in (64, 128):
+        return False
+    if not _qmm_supports_group_size(int(group_size)):
         return False
     bits = getattr(linear, "bits", None)
     if bits not in _SUPPORTED_QMM_BITS or getattr(linear, "mode", None) != "affine":
@@ -84,7 +95,7 @@ def _is_supported_affine_linear_shape(
         return False
     if scales.shape != biases.shape:
         return False
-    return scales.shape[0] == weight.shape[0] and scales.shape[1] == input_dim // 64
+    return scales.shape[0] == weight.shape[0] and scales.shape[1] == input_dim // group_size
 
 
 def _is_supported_affine_linear(linear: Any, x: mx.array) -> bool:
@@ -150,7 +161,8 @@ def _linear_qmm(linear: nn.QuantizedLinear, x: mx.array, variant: int) -> mx.arr
         return linear(x)
     if not _is_supported_affine_linear(linear, x):
         return linear(x)
-    return qmm(x, linear.weight, linear.scales, linear.biases, variant)
+    gs = int(getattr(linear, "group_size", 64))
+    return qmm(x, linear.weight, linear.scales, linear.biases, variant, gs)
 
 
 def _make_patched_mlp(
@@ -392,13 +404,12 @@ def apply_qwen35_q4_lm_prefill_linear_patch() -> bool:
         orig_attn = attn_cls.__call__
         try:
             attn_module = importlib.import_module(attn_cls.__module__)
-            sdpa = attn_module.scaled_dot_product_attention
         except Exception:
-            sdpa = None
+            attn_module = None
 
         def patched_attention(self, x, mask=None, cache=None):
             if (
-                sdpa is None
+                attn_module is None
                 or x.ndim != 3
                 or x.shape[-2] < min_tokens
                 or not all(
@@ -406,6 +417,16 @@ def apply_qwen35_q4_lm_prefill_linear_patch() -> bool:
                     for linear in (self.q_proj, self.k_proj, self.v_proj)
                 )
             ):
+                return orig_attn(self, x, mask=mask, cache=cache)
+
+            # Resolve SDPA per call, never at patch time. TurboQuant installs
+            # its own dispatcher when a TQ-enabled model loads, which can be
+            # after this patch is already in place (any earlier non-TQ load
+            # installs it). A snapshot taken here would keep routing TurboQuant
+            # caches into the plain mlx-lm SDPA, which then reads the
+            # group_size that only quantized caches carry (issue #2372).
+            sdpa = getattr(attn_module, "scaled_dot_product_attention", None)
+            if sdpa is None:
                 return orig_attn(self, x, mask=mask, cache=cache)
 
             B, L, _ = x.shape
