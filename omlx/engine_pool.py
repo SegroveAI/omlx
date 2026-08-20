@@ -54,6 +54,123 @@ from .utils.proc_memory import get_phys_footprint
 
 logger = logging.getLogger(__name__)
 
+_FP16_BYTES = 2
+_MAX_AFFINE_BYTES_PER_WEIGHT = 1.0625  # q8 plus fp16 scale/bias per group
+_CPU_SHARE_MATERIALIZATION_HEADROOM = 1.5
+
+
+def _positive_int(value: object) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return parsed if parsed > 0 else 0
+
+
+def _aligned_share_rows(outputs: int, fraction: float) -> int:
+    if outputs <= 0 or fraction <= 0:
+        return 0
+    return min(outputs, (int(outputs * fraction) // 64) * 64)
+
+
+def _qwen35_cpu_share_estimated_bytes(
+    model_path: str,
+    settings: object | None,
+) -> int | None:
+    """Estimate peak bytes added while materializing Qwen CPU-share rows.
+
+    The source checkpoint retains its packed weights. Gate/up and GDN add
+    eager FP16 row slices, while down sharing additionally retains a copied
+    quantized GPU suffix. The final multiplier covers the per-layer
+    dequantize/concatenate scratch observed during eager preparation. ``None``
+    means CPU sharing was requested for a Qwen checkpoint whose geometry could
+    not be established safely; callers must use a conservative fallback.
+    """
+
+    if (
+        settings is None
+        or not bool(getattr(settings, "qwen35_ane_prefill_enabled", False))
+        or not bool(getattr(settings, "qwen35_ane_prefill_cpu_enabled", False))
+    ):
+        return 0
+
+    config_path = Path(model_path) / "config.json"
+    try:
+        config = json.loads(config_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(config, dict):
+        return None
+    text = config.get("text_config")
+    if not isinstance(text, dict):
+        text = config
+    model_type = str(text.get("model_type") or config.get("model_type") or "")
+    if not any(token in model_type for token in ("qwen3_5", "qwen3_6", "qwen3_8")):
+        return 0
+
+    hidden = _positive_int(text.get("hidden_size"))
+    intermediate = _positive_int(text.get("intermediate_size"))
+    layer_count = _positive_int(text.get("num_hidden_layers"))
+    if not hidden or not intermediate or not layer_count:
+        return None
+    layer_count = min(
+        layer_count,
+        max(0, int(getattr(settings, "qwen35_ane_prefill_max_layers", 64) or 0)),
+    )
+
+    extra = 0.0
+    gate_fraction = float(
+        getattr(settings, "qwen35_ane_prefill_cpu_fraction", 0.0) or 0.0
+    )
+    gate_rows = _aligned_share_rows(intermediate, gate_fraction)
+    if gate_rows:
+        extra += layer_count * 2 * gate_rows * hidden * _FP16_BYTES
+
+    down_fraction = float(
+        getattr(settings, "qwen35_ane_prefill_cpu_down_fraction", 0.0) or 0.0
+    )
+    down_rows = _aligned_share_rows(hidden, down_fraction)
+    if down_rows and down_rows < hidden:
+        cpu_weight = down_rows * intermediate * _FP16_BYTES
+        gpu_suffix = (hidden - down_rows) * intermediate * _MAX_AFFINE_BYTES_PER_WEIGHT
+        extra += layer_count * (cpu_weight + gpu_suffix)
+
+    gdn_fraction = float(
+        getattr(settings, "qwen35_ane_prefill_cpu_gdn_fraction", 0.0) or 0.0
+    )
+    if gdn_fraction > 0 and bool(getattr(settings, "qwen35_ane_prefill_gdn", True)):
+        key_heads = _positive_int(text.get("linear_num_key_heads"))
+        key_dim = _positive_int(text.get("linear_key_head_dim"))
+        value_heads = _positive_int(text.get("linear_num_value_heads"))
+        value_dim = _positive_int(text.get("linear_value_head_dim"))
+        qkv_outputs = 2 * key_heads * key_dim + value_heads * value_dim
+        z_outputs = value_heads * value_dim
+        if not qkv_outputs or not z_outputs:
+            return None
+        gdn_rows = min(
+            qkv_outputs,
+            _aligned_share_rows(qkv_outputs + z_outputs, gdn_fraction),
+        )
+        layer_types = text.get("layer_types")
+        if isinstance(layer_types, list):
+            gdn_layers = sum(
+                "linear" in str(layer_type).lower() for layer_type in layer_types
+            )
+        else:
+            # Qwen hybrid checkpoints use full attention periodically. Without
+            # the explicit map, charging every layer is the safe estimate.
+            gdn_layers = _positive_int(text.get("num_hidden_layers"))
+        gdn_layers = min(
+            gdn_layers,
+            max(
+                0,
+                int(getattr(settings, "qwen35_ane_prefill_gdn_max_layers", 48) or 0),
+            ),
+        )
+        extra += gdn_layers * gdn_rows * hidden * _FP16_BYTES
+
+    return int(extra * _CPU_SHARE_MATERIALIZATION_HEADROOM)
+
 
 @dataclass
 class EngineEntry:
@@ -77,6 +194,7 @@ class EngineEntry:
     estimated_size: int  # Pre-calculated from safetensors (bytes)
     text_only_size: int = 0  # Language-only estimate for VLM checkpoints (0 = n/a)
     actual_size: int | None = None  # Observed process-memory delta after load settles
+    runtime_estimated_size: int | None = None  # Includes active load-time variants
     config_model_type: str = (
         ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
     )
@@ -109,6 +227,7 @@ class EngineEntry:
     in_use: int = 0  # in-flight acquire/use lease count; never evict while > 0
     abort_requested: bool = False  # Set under hard pressure for leased requests
     pending_unload_reason: str | None = None  # Unload as soon as leases/activity drain
+    pending_unload_allow_pinned: bool = False  # Explicit unload may override pinning
     # Requested load-time variant. This deliberately tracks the settings that
     # produced the engine, even when an optional accelerator fails soft and the
     # engine falls back, so identical requests keep reusing that fallback.
@@ -153,6 +272,8 @@ class EnginePool:
         self._entries: dict[str, EngineEntry] = {}
         self._lock = asyncio.Lock()
         self._current_model_memory = 0
+        # Scanned model roots, kept for org-qualified display/upload names.
+        self._model_dirs: list[Path] = []
         self._scheduler_config = scheduler_config or SchedulerConfig()
         self._process_memory_enforcer: object | None = None  # Set by server
         self._get_final_ceiling: object | None = None  # Set by server
@@ -164,6 +285,8 @@ class EnginePool:
         self._load_seconds_per_gb_ema: float | None = None
         self._load_time_observations: int = 0
         self._lease_release_tasks: set[asyncio.Task[None]] = set()
+        self._pending_unload_tasks: dict[str, asyncio.Task[None]] = {}
+        self._shutting_down = False
         self.configure_hot_cache_budget()
 
     def _distributed_deployment_for_entry(
@@ -185,6 +308,9 @@ class EnginePool:
     def _entry_resident_size(self, entry: EngineEntry) -> int:
         """Return this process's planned weights, not the full cluster model."""
 
+        if entry.runtime_estimated_size is not None:
+            return entry.runtime_estimated_size
+
         deployment = self._distributed_deployment_for_entry(entry)
         if deployment is None:
             return entry.estimated_size
@@ -197,6 +323,37 @@ class EnginePool:
             if assignment is not None
             else entry.estimated_size
         )
+
+    def _entry_runtime_resident_size(
+        self,
+        entry: EngineEntry,
+        runtime_settings: object | None,
+        *,
+        base_size: int | None = None,
+    ) -> int:
+        """Include eager CPU-share storage in load and prefill accounting."""
+
+        base = self._entry_resident_size(entry) if base_size is None else base_size
+        if self._distributed_deployment_for_entry(entry) is not None:
+            return base
+        extra = _qwen35_cpu_share_estimated_bytes(entry.model_path, runtime_settings)
+        if extra is None:
+            # An enabled CPU path with unreadable geometry must not silently
+            # retain the quantized estimate. One additional model-sized charge
+            # is conservative and lets normal admission produce useful errors.
+            extra = entry.estimated_size
+            logger.warning(
+                "Could not determine Qwen CPU-share geometry for %s; "
+                "reserving one additional model-sized memory allowance",
+                entry.model_id,
+            )
+        if extra > 0:
+            logger.info(
+                "Qwen CPU sharing adds %s to the projected memory for %s",
+                format_size(extra),
+                entry.model_id,
+            )
+        return base + extra
 
     @property
     def current_model_memory(self) -> int:
@@ -372,6 +529,50 @@ class EnginePool:
             add("turboquant_kv_bits", data.get("turboquant_kv_bits", 4))
             add("turboquant_skip_last", data.get("turboquant_skip_last", True))
 
+        qwen_ane_active = bool(data.get("qwen35_ane_prefill_enabled", False))
+        add("qwen35_ane_prefill_enabled", qwen_ane_active)
+        if qwen_ane_active:
+            add(
+                "qwen35_ane_prefill_sequence_length",
+                data.get("qwen35_ane_prefill_sequence_length", 2048),
+            )
+            add("qwen35_ane_prefill_fraction", data.get("qwen35_ane_prefill_fraction", 0.53))
+            add("qwen35_ane_prefill_max_layers", data.get("qwen35_ane_prefill_max_layers", 64))
+            add("qwen35_ane_prefill_dual_ane", data.get("qwen35_ane_prefill_dual_ane", True))
+            add("qwen35_ane_prefill_gdn", data.get("qwen35_ane_prefill_gdn", True))
+            if data.get("qwen35_ane_prefill_gdn", True):
+                add(
+                    "qwen35_ane_prefill_gdn_fraction",
+                    data.get("qwen35_ane_prefill_gdn_fraction", 0.50),
+                )
+                add(
+                    "qwen35_ane_prefill_gdn_max_layers",
+                    data.get("qwen35_ane_prefill_gdn_max_layers", 48),
+                )
+            cpu_active = bool(data.get("qwen35_ane_prefill_cpu_enabled", False))
+            add("qwen35_ane_prefill_cpu_enabled", cpu_active)
+            if cpu_active:
+                add(
+                    "qwen35_ane_prefill_cpu_fraction",
+                    data.get("qwen35_ane_prefill_cpu_fraction", 0.135),
+                )
+                add(
+                    "qwen35_ane_prefill_cpu_down_fraction",
+                    data.get("qwen35_ane_prefill_cpu_down_fraction", 0.0),
+                )
+                add(
+                    "qwen35_ane_prefill_cpu_gdn_fraction",
+                    data.get("qwen35_ane_prefill_cpu_gdn_fraction", 0.0),
+                )
+                add(
+                    "qwen35_ane_prefill_cpu_threads",
+                    data.get("qwen35_ane_prefill_cpu_threads", 8),
+                )
+                add(
+                    "qwen35_ane_prefill_cpu_shared_resource",
+                    data.get("qwen35_ane_prefill_cpu_shared_resource", True),
+                )
+
         specprefill_active = bool(data.get("specprefill_enabled", False)) and has_value(
             "specprefill_draft_model"
         )
@@ -423,6 +624,7 @@ class EnginePool:
                 )
             add("dflash_draft_window_size", data.get("dflash_draft_window_size"))
             add("dflash_draft_sink_size", data.get("dflash_draft_sink_size"))
+            add("dflash_block_size", data.get("dflash_block_size"))
             add("dflash_verify_mode", data.get("dflash_verify_mode"))
 
         vlm_mtp_active = bool(data.get("vlm_mtp_enabled", False)) and has_value(
@@ -476,6 +678,7 @@ class EnginePool:
             dirs = [Path(model_dirs)]
         else:
             dirs = [Path(d) for d in model_dirs]
+        self._model_dirs = dirs
 
         if len(dirs) == 1:
             discovered = discover_models(dirs[0])
@@ -903,6 +1106,31 @@ class EnginePool:
     def _entry_is_busy(self, entry: EngineEntry) -> bool:
         return entry.in_use > 0 or self._entry_has_active_requests(entry)
 
+    def _entry_has_scheduler_work(self, entry: EngineEntry) -> bool:
+        """Return True until deferred aborts have actually left the scheduler."""
+        scheduler = self._resolve_scheduler_from_engine(entry.engine)
+        if scheduler is None:
+            return False
+        has_requests = getattr(scheduler, "has_requests", None)
+        if callable(has_requests):
+            try:
+                if has_requests():
+                    return True
+            except Exception:
+                return True
+        for attr in ("running", "waiting", "prefilling", "requests"):
+            if getattr(scheduler, attr, None):
+                return True
+        return False
+
+    def _entry_is_quiescent(self, entry: EngineEntry) -> bool:
+        """Return True only after leases, collectors, and scheduler work drain."""
+        return not (
+            entry.in_use > 0
+            or self._entry_has_active_requests(entry)
+            or self._entry_has_scheduler_work(entry)
+        )
+
     def _raise_if_reload_busy(self, entry: EngineEntry, operation: str) -> None:
         if self._entry_is_busy(entry):
             raise ModelBusyError(entry.model_id, operation)
@@ -935,17 +1163,25 @@ class EnginePool:
         reason: str,
         *,
         abort_requested: bool = False,
+        allow_pinned: bool = False,
     ) -> bool:
-        """Mark a loaded non-pinned model for unload once it is no longer busy.
+        """Mark a loaded model for unload once it is no longer busy.
 
         Caller must hold ``self._lock``. Returns True when a pending marker was
         installed. The method deliberately does not unload by itself; call
         ``_unload_pending_if_idle_locked`` after abort/release state changes.
+        Pinning is respected unless an explicit caller opts out.
         """
         entry = self._entries.get(model_id)
-        if entry is None or entry.engine is None or entry.is_loading or entry.is_pinned:
+        if (
+            entry is None
+            or entry.engine is None
+            or entry.is_loading
+            or (entry.is_pinned and not allow_pinned)
+        ):
             return False
         entry.pending_unload_reason = reason
+        entry.pending_unload_allow_pinned = allow_pinned
         if abort_requested:
             entry.abort_requested = True
         return True
@@ -958,8 +1194,8 @@ class EnginePool:
             if (
                 entry.engine is None
                 or entry.is_loading
-                or entry.is_pinned
-                or self._entry_is_busy(entry)
+                or (entry.is_pinned and not entry.pending_unload_allow_pinned)
+                or not self._entry_is_quiescent(entry)
             ):
                 continue
             candidates.append((entry.last_access, mid))
@@ -979,13 +1215,14 @@ class EnginePool:
             or entry.engine is None
             or not entry.pending_unload_reason
             or entry.is_loading
-            or entry.is_pinned
-            or self._entry_is_busy(entry)
+            or (entry.is_pinned and not entry.pending_unload_allow_pinned)
+            or not self._entry_is_quiescent(entry)
         ):
             return False
 
         reason = entry.pending_unload_reason
         entry.pending_unload_reason = None
+        entry.pending_unload_allow_pinned = False
         entry.abort_requested = False
         logger.warning(
             "Unloading pending model '%s' after activity drained (%s)",
@@ -995,11 +1232,122 @@ class EnginePool:
         await self._unload_engine(model_id)
         return True
 
+    def _finish_pending_unload_task(
+        self,
+        model_id: str,
+        task: asyncio.Task[None],
+    ) -> None:
+        if self._pending_unload_tasks.get(model_id) is task:
+            self._pending_unload_tasks.pop(model_id, None)
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception("Pending unload task failed for '%s'", model_id)
+
+    def _schedule_pending_unload_locked(self, model_id: str) -> None:
+        current = self._pending_unload_tasks.get(model_id)
+        if current is not None and not current.done():
+            return
+        task = asyncio.create_task(
+            self._wait_for_pending_unload(model_id),
+            name=f"engine-pending-unload:{model_id}",
+        )
+        self._pending_unload_tasks[model_id] = task
+        task.add_done_callback(
+            lambda completed, mid=model_id: self._finish_pending_unload_task(
+                mid, completed
+            )
+        )
+
+    async def _wait_for_pending_unload(self, model_id: str) -> None:
+        """Poll scheduler state without ever tearing down an in-flight MLX step."""
+        while not self._shutting_down:
+            async with self._lock:
+                entry = self._entries.get(model_id)
+                if (
+                    entry is None
+                    or entry.engine is None
+                    or not entry.pending_unload_reason
+                ):
+                    return
+                if await self._unload_pending_if_idle_locked(model_id):
+                    return
+            await asyncio.sleep(0.1)
+
+    async def request_unload(
+        self,
+        model_id: str,
+        *,
+        reason: str = "manual unload",
+    ) -> bool:
+        """Unload now when idle, otherwise abort and unload after quiescence.
+
+        Returns True when the engine was unloaded before this call returned and
+        False when teardown was queued. New acquisitions are rejected while the
+        pending marker is installed, so the engine can drain deterministically.
+        """
+        async with self._lock:
+            entry = self._entries.get(model_id)
+            if entry is None or entry.engine is None:
+                return True
+            if entry.is_loading:
+                raise ModelLoadingError(
+                    model_id,
+                    f"Model '{model_id}' is still loading and cannot be unloaded yet",
+                )
+            if self._entry_is_quiescent(entry):
+                await self._unload_engine(model_id)
+                return True
+
+            self._mark_pending_unload_locked(
+                model_id,
+                reason,
+                abort_requested=True,
+                allow_pinned=True,
+            )
+            abort_all = getattr(entry.engine, "abort_all_requests", None)
+            if callable(abort_all):
+                try:
+                    await abort_all(
+                        reason=(
+                            f"Request aborted because model '{model_id}' is being unloaded"
+                        ),
+                        error_code="model_unloading",
+                    )
+                except TypeError:
+                    # Non-batched engines may expose the older no-argument hook.
+                    await abort_all()
+                except Exception:
+                    logger.warning(
+                        "Failed to request abort before unloading '%s'",
+                        model_id,
+                        exc_info=True,
+                    )
+
+            if await self._unload_pending_if_idle_locked(model_id):
+                return True
+            self._schedule_pending_unload_locked(model_id)
+            logger.warning(
+                "Queued unload for model '%s' until active scheduler work drains",
+                model_id,
+            )
+            return False
+
     def is_abort_requested(self, model_id: str | None) -> bool:
         if model_id is None:
             return False
         entry = self._entries.get(model_id)
         return bool(entry and entry.abort_requested)
+
+    def get_abort_requested_reason(self, model_id: str | None) -> str | None:
+        if model_id is None:
+            return None
+        entry = self._entries.get(model_id)
+        if entry is None or not entry.abort_requested:
+            return None
+        return entry.pending_unload_reason or "request abort"
 
     async def get_engine(
         self,
@@ -1047,6 +1395,8 @@ class EnginePool:
             entry = self._entries.get(model_id)
             if not entry:
                 raise ModelNotFoundError(model_id, list(self._entries.keys()))
+            if entry.pending_unload_reason:
+                raise ModelBusyError(model_id, "start work while unload is pending")
             expected_signature = self._engine_runtime_signature(
                 model_id,
                 runtime_settings,
@@ -1127,10 +1477,22 @@ class EnginePool:
             # vision-inclusive file size (#2385).
             deployment = self._distributed_deployment_for_entry(entry)
             admission_size = self._entry_resident_size(entry)
-            if deployment is None and entry.text_only_size and (
-                force_lm or entry.engine_type == "batched"
+            if (
+                deployment is None
+                and entry.text_only_size
+                and (force_lm or entry.engine_type == "batched")
             ):
                 admission_size = entry.text_only_size
+            admission_settings = runtime_settings
+            if admission_settings is None and self._settings_manager is not None:
+                get_settings = getattr(self._settings_manager, "get_settings", None)
+                if callable(get_settings):
+                    admission_settings = get_settings(model_id)
+            admission_size = self._entry_runtime_resident_size(
+                entry,
+                admission_settings,
+                base_size=admission_size,
+            )
             admission_kind = "local shard" if deployment is not None else "model"
             ceiling = self._current_ceiling()
             best_effort = False
@@ -1719,7 +2081,9 @@ class EnginePool:
         entry.actual_size = None
         entry.abort_requested = False
         entry.pending_unload_reason = None
+        entry.pending_unload_allow_pinned = False
         entry.runtime_settings_signature = None
+        entry.runtime_estimated_size = None
 
         if distributed:
             # Cluster weights live in supervised rank processes, not this
@@ -1939,6 +2303,21 @@ class EnginePool:
             if model_settings is None and self._settings_manager is not None:
                 model_settings = self._settings_manager.get_settings(model_id)
 
+            deployment = self._distributed_deployment_for_entry(entry)
+            base_resident_size = self._entry_resident_size(entry)
+            if (
+                deployment is None
+                and entry.text_only_size
+                and (force_lm or entry.engine_type == "batched")
+            ):
+                base_resident_size = entry.text_only_size
+            resident_size = self._entry_runtime_resident_size(
+                entry,
+                model_settings,
+                base_size=base_resident_size,
+            )
+            entry.runtime_estimated_size = resident_size
+
             # Wire the correct model_id / model_path into the shared scheduler
             # config so every engine (Batched/VLM/DFlash/Embedding) sees the
             # right values when it builds `SchedulerConfig` internally.
@@ -1959,11 +2338,7 @@ class EnginePool:
             # Check if DFlash is enabled -- takes priority over engine type
             # since DFlash has its own model loading pipeline
             engine = None
-            deployment = (
-                self._distributed_deployment_for_entry(entry)
-                if effective_type == "batched"
-                else None
-            )
+            deployment = deployment if effective_type == "batched" else None
             if deployment is None and model_settings is not None:
                 dflash_enabled = getattr(model_settings, "dflash_enabled", False)
                 dflash_draft = getattr(model_settings, "dflash_draft_model", None)
@@ -2409,6 +2784,8 @@ class EnginePool:
             entry.is_loading = False
             entry.loading_started_at = None
             entry.abort_loading = False
+            if not load_completed:
+                entry.runtime_estimated_size = None
             self._wake_process_memory_enforcer()
 
     async def preload_pinned_models(self) -> None:
@@ -2430,6 +2807,10 @@ class EnginePool:
 
     async def shutdown(self) -> None:
         """Shutdown all engines gracefully."""
+        self._shutting_down = True
+        pending_tasks = tuple(self._pending_unload_tasks.values())
+        if pending_tasks:
+            await asyncio.gather(*pending_tasks, return_exceptions=True)
         await self._drain_lease_release_tasks()
         async with self._lock:
             for model_id in list(self._entries.keys()):

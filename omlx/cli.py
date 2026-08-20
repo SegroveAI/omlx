@@ -541,6 +541,7 @@ def launch_command(args, extra_args: list[str] | None = None):
         reasoning=model_info.get("enable_thinking"),
         tools_profile=getattr(args, "tools_profile", "coding"),
         extra_args=tuple(extra_args or ()),
+        cross_session=getattr(args, "cross_session", False),
     )
 
     # Launch
@@ -1258,6 +1259,17 @@ Example directory structure:
         default=None,
         help="Claude Code Haiku tier model (Claude integration only)",
     )
+    launch_parser.add_argument(
+        "--cross-session",
+        action="store_true",
+        default=False,
+        help=(
+            "Allow the launched session to be reachable via Claude Code's "
+            "cross-session messaging (ListAgents/SendMessage). This requires "
+            "enabling telemetry and feature-flag traffic to Anthropic that is "
+            "otherwise kept disabled by default (Claude integration only)."
+        ),
+    )
 
     # Diagnose command
     diagnose_parser = subparsers.add_parser(
@@ -1400,10 +1412,16 @@ Example directory structure:
         help="Emit machine-readable JSON",
     )
 
-    # Use parse_known_args so `omlx launch <tool> -- ...` can forward unknown
-    # tokens (e.g. `-r`, `--resume <id>`) to the underlying tool binary.
-    # Non-launch commands keep the previous strictness by rejecting unknowns.
-    args, extra_args = parser.parse_known_args()
+    # Split launch's forwarding separator before argparse. parse_known_args()
+    # inconsistently retains it when known options precede it, and stripping it
+    # afterward cannot distinguish it from a separator intended for the tool.
+    argv = sys.argv[1:]
+    if argv[:1] == ["launch"] and "--" in argv[2:]:
+        separator_index = argv.index("--", 2)
+        args, extra_args = parser.parse_known_args(argv[:separator_index])
+        extra_args.extend(argv[separator_index + 1 :])
+    else:
+        args, extra_args = parser.parse_known_args(argv)
 
     if args.command == "launch":
         launch_command(args, extra_args=extra_args)
