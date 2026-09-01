@@ -23,6 +23,18 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         )
     }
 
+    func testLightningMtpAllowsTurboQuantInWorkingProfile() {
+        let vm = ModelSettingsScreenVM()
+        vm.mtpEnabled = true
+        vm.turboquantKvEnabled = true
+
+        XCTAssertNil(vm.mtpConflictReason)
+
+        let settings = vm.currentSettingsDict()
+        XCTAssertEqual(settings["mtp_enabled"]?.value as? Bool, true)
+        XCTAssertEqual(settings["turboquant_kv_enabled"]?.value as? Bool, true)
+    }
+
     func testVlmMtpDraftModelOptionsIncludeQwenMtpConfigType() {
         let vm = ModelSettingsScreenVM()
         vm.modelID = "Qwopus3.6-35B-A3B-v1-4bit-MLXVLM-Target"
@@ -88,6 +100,13 @@ final class ModelSettingsScreenVMTests: XCTestCase {
     func testQwenAneArbitraryInputValidation() {
         XCTAssertEqual(try? QwenAneSettingsValidator.promptBlock("2112").get(), 2112)
         XCTAssertThrowsError(try QwenAneSettingsValidator.promptBlock("2100").get())
+        XCTAssertEqual(
+            try? QwenAneSettingsValidator.tailPadding("1357", sequenceLength: "2048").get(),
+            1357
+        )
+        XCTAssertThrowsError(
+            try QwenAneSettingsValidator.tailPadding("2048", sequenceLength: "2048").get()
+        )
         XCTAssertEqual(
             try? QwenAneSettingsValidator.mlpFraction("0.467", cpuFraction: "0.137").get(),
             0.467
@@ -174,11 +193,13 @@ final class ModelSettingsScreenVMTests: XCTestCase {
                 cpuFraction: nil,
                 cpuDownFraction: nil,
                 cpuGdnFraction: nil,
+                fusedDown: true,
                 cpuThreads: nil,
                 cpuSharedResource: nil,
                 processingTps: 123.4,
                 speedupPercent: 12.3,
-                sequenceLength: 2112
+                sequenceLength: 2112,
+                tailPaddingMinTokens: 1400
             ),
             error: nil,
             terminationReason: nil
@@ -193,7 +214,9 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertTrue(vm.profileDirty)
         XCTAssertTrue(vm.qwen35AnePrefillEnabled)
         XCTAssertEqual(vm.qwen35AnePrefillSequenceLength, "2112")
+        XCTAssertEqual(vm.qwen35AnePrefillTailPaddingMinTokens, "1400")
         XCTAssertEqual(vm.qwen35AnePrefillFraction, "0.467")
+        XCTAssertTrue(vm.qwen35AnePrefillFusedDown)
         XCTAssertFalse(vm.qwen35AnePrefillDualAne)
         XCTAssertTrue(vm.qwen35AnePrefillGdn)
         XCTAssertEqual(vm.qwen35AnePrefillGdnFraction, "0.527")
@@ -212,6 +235,29 @@ final class ModelSettingsScreenVMTests: XCTestCase {
 
         vm.model = makeModel(id: "other", configModelType: "gemma4")
         XCTAssertFalse(vm.isQwen35AnePrefillModel)
+    }
+
+    func testQwen4SsdOffloadWireKeysAndCompatibility() throws {
+        let vm = ModelSettingsScreenVM()
+        vm.model = makeModel(id: "qwen4", configModelType: "qwen4_exp")
+        XCTAssertTrue(vm.isQwen4Exp)
+
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let dto = try decoder.decode(
+            ModelSettingsDTO.self,
+            from: Data(#"{"qwen4_ple_ssd_offload":true}"#.utf8)
+        )
+        XCTAssertEqual(dto.qwen4PleSsdOffload, true)
+
+        var patch = ModelSettingsPatch()
+        patch.qwen4PleSsdOffload = true
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        let object = try JSONSerialization.jsonObject(
+            with: encoder.encode(patch)
+        ) as? [String: Any]
+        XCTAssertEqual(object?["qwen4_ple_ssd_offload"] as? Bool, true)
     }
 
     func testQwenAneSettingsDecodeFromServerAndEncodeForPatch() throws {
@@ -317,6 +363,10 @@ final class ModelSettingsScreenVMTests: XCTestCase {
             dflashSsdCacheAvailable: nil,
             mtpCompatible: nil,
             mtpCompatibilityReason: nil,
+            qwen4PleSsdOffloadSupported: nil,
+            qwen4PleSsdOffloadForced: nil,
+            qwen4PleResidentBytes: nil,
+            qwen4PleMmapBytes: nil,
             virtual: nil,
             settings: nil
         )

@@ -29,6 +29,10 @@ logger = logging.getLogger(__name__)
 # Current settings file format version
 SETTINGS_VERSION = 1
 
+# The Lightning MTP runtime clamps deeper requests to this global ceiling.
+# Keep API validation and runtime normalization on the same contract.
+MAX_LIGHTNING_MTP_DRAFT_TOKENS = 8
+
 
 def vlm_mtp_processor_conflicts(data: dict) -> list:
     """Names of settings that need per-request logits processors and
@@ -114,8 +118,12 @@ class ModelSettings:
             ANE/GPU prompt processing.
         qwen35_ane_prefill_sequence_length: Exact flattened token count routed
             through the eagerly compiled ANE programs.
+        qwen35_ane_prefill_tail_padding_min_tokens: Smallest residual tokenwise
+            projection block padded to the compiled ANE shape (zero disables).
         qwen35_ane_prefill_fraction: Fraction of eligible MLP outputs assigned
             across the ANE instances.
+        qwen35_ane_prefill_fused_down: Fuse SwiGLU and partial down projection
+            into each dual-ANE/CPU hidden-channel branch.
         qwen35_ane_prefill_max_layers: Maximum eligible MLP layers accelerated.
         qwen35_ane_prefill_dual_ane: Pin a procedure bank to each physical ANE.
         qwen35_ane_prefill_gdn: Also accelerate eligible GDN input projections.
@@ -208,6 +216,10 @@ class ModelSettings:
     enable_thinking: Optional[bool] = (
         None  # Explicit toggle for thinking/reasoning mode (None = auto)
     )
+    # Qwen4-Exp only: keep the large PLE N-gram table on SSD and gather rows
+    # through mmap. The runtime may force this on when resident loading cannot
+    # fit under the configured model-memory ceiling but mmap loading can.
+    qwen4_ple_ssd_offload: bool = False
     preserve_thinking: Optional[bool] = (
         None  # Keep <think> blocks in historical turns (None = auto, True when template supports it)
     )
@@ -231,7 +243,9 @@ class ModelSettings:
     # cache memory and rely on undocumented AppleNeuralEngine interfaces.
     qwen35_ane_prefill_enabled: bool = False
     qwen35_ane_prefill_sequence_length: int = 2048
+    qwen35_ane_prefill_tail_padding_min_tokens: int = 0
     qwen35_ane_prefill_fraction: float = 0.53
+    qwen35_ane_prefill_fused_down: bool = False
     qwen35_ane_prefill_max_layers: int = 64
     qwen35_ane_prefill_dual_ane: bool = True
     qwen35_ane_prefill_gdn: bool = True

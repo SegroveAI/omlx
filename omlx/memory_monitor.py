@@ -43,7 +43,7 @@ except ImportError:
 # different head dimensions; unsupported cases fall back to an unfused
 # score-matrix allocation.
 _SDPA_VECTOR_QUERY_TOKEN_THRESHOLD = 8
-_SDPA_FULL_SUPPORTED_HEAD_DIMS = frozenset({64, 80, 128})
+_SDPA_FULL_SUPPORTED_HEAD_DIMS = frozenset({64, 72, 80, 96, 128})
 _SDPA_VECTOR_SUPPORTED_HEAD_DIMS = frozenset({64, 96, 128, 256})
 # Default bytes/elem for the materialized unfused score matrix when the model's
 # compute dtype is unknown. MLX softmax accumulates in fp32, but the dominant
@@ -58,22 +58,43 @@ _SDPA_FALLBACK_SCORE_DTYPE_SIZE = 2
 # kernel instead of the unfused O(L^2) score-matrix fallback. Populated at
 # runtime by the kernel patch that installs the route (see
 # omlx/patches/sdpa256_attention.py); empty otherwise, so the estimate stays
-# O(L^2) when no such kernel is active. Maps head_dim -> kv_tile (the kernel's
-# KV block width, which bounds the per-chunk score transient).
-_SDPA_TILED_PREFILL_HEAD_DIMS: dict[int, int] = {}
-_SDPA_TILED_MIN_KV_LEN = 8192
+# O(L^2) when no such kernel is active. Each entry records the query/KV shape
+# floor actually covered by the installed route plus a conservative score-tile
+# width for admission accounting.
+
+
+@dataclass(frozen=True)
+class _BoundedSDPAPrefillRoute:
+    min_query_len: int
+    min_kv_len: int
+    kv_tile: int
+
+
+_SDPA_TILED_PREFILL_HEAD_DIMS: dict[int, tuple[_BoundedSDPAPrefillRoute, ...]] = {}
 
 
 def register_tiled_prefill_head_dim(
-    head_dim: int, *, min_kv_len: int = 8192, kv_tile: int = 1024
+    head_dim: int,
+    *,
+    min_query_len: int = 2,
+    min_kv_len: int = 8192,
+    kv_tile: int = 1024,
 ) -> None:
-    """Register a head_dim whose long-context prefill now uses an O(L) tiled
-    kernel, so the prefill memory estimate stops charging the O(L^2) score
-    matrix for it. Must be called in lockstep with installing the kernel route,
-    or the guard keeps rejecting valid long-context requests."""
-    global _SDPA_TILED_MIN_KV_LEN
-    _SDPA_TILED_PREFILL_HEAD_DIMS[int(head_dim)] = int(kv_tile)
-    _SDPA_TILED_MIN_KV_LEN = int(min_kv_len)
+    """Register a bounded long-context route installed for one head dim.
+
+    Multiple native routes may cover the same head dimension at different
+    thresholds. Store them independently so combining two registrations can
+    never invent shape coverage that neither route actually guarantees.
+    """
+    head_dim = int(head_dim)
+    route = _BoundedSDPAPrefillRoute(
+        min_query_len=max(2, int(min_query_len)),
+        min_kv_len=max(1, int(min_kv_len)),
+        kv_tile=max(1, int(kv_tile)),
+    )
+    routes = _SDPA_TILED_PREFILL_HEAD_DIMS.get(head_dim, ())
+    if route not in routes:
+        _SDPA_TILED_PREFILL_HEAD_DIMS[head_dim] = (*routes, route)
 
 
 # Bytes/elem of a model-built additive attention bias materialized as a
@@ -91,9 +112,7 @@ def register_attention_bias_transient(dtype_size: float | None) -> None:
     model load/swap: the setting is process-wide, like the tiled head_dim
     registry above."""
     global _ATTENTION_BIAS_TRANSIENT_DTYPE_SIZE
-    _ATTENTION_BIAS_TRANSIENT_DTYPE_SIZE = (
-        float(dtype_size) if dtype_size else None
-    )
+    _ATTENTION_BIAS_TRANSIENT_DTYPE_SIZE = float(dtype_size) if dtype_size else None
 
 
 def estimate_unfused_sdpa_call_bytes(
@@ -397,6 +416,16 @@ class MemoryMonitor:
         """
         # In paged SSD-only mode, no memory to free from KV cache
         return 0
+
+    def clear_ane_prefill_transient(self) -> None:
+        """Stop reserving ANE prefill I/O surfaces after the banks are shed.
+
+        The reservation is snapshotted at load; once the runtime headroom
+        rung releases the banks the surfaces are gone, so keeping the term
+        would make every later admission pass pause for memory that can no
+        longer be reclaimed. The next load re-prices it via set_model_info.
+        """
+        self._ane_prefill_transient_bytes = 0
 
     def set_model_info(
         self,
@@ -721,13 +750,17 @@ class MemoryMonitor:
         # [n_q, query_tokens, kv_len] matrix. This matches the kernel's route
         # gate (query_len > 1, kv_len >= threshold); any query_len <= 1 already
         # returned above via the fused vector path.
-        kv_tile = _SDPA_TILED_PREFILL_HEAD_DIMS.get(hd)
-        if (
-            kv_tile is not None
-            and query_tokens > 1
-            and kv_len >= _SDPA_TILED_MIN_KV_LEN
-        ):
-            tile_scores = n_q * query_tokens * min(kv_tile, kv_len) * self._score_dtype_size
+        bounded_routes = _SDPA_TILED_PREFILL_HEAD_DIMS.get(hd, ())
+        matching_routes = [
+            route
+            for route in bounded_routes
+            if query_tokens >= route.min_query_len and kv_len >= route.min_kv_len
+        ]
+        if matching_routes:
+            kv_tile = max(route.kv_tile for route in matching_routes)
+            tile_scores = (
+                n_q * query_tokens * min(kv_tile, kv_len) * self._score_dtype_size
+            )
             return output + tile_scores + bias
 
         return (
@@ -750,9 +783,9 @@ class MemoryMonitor:
         cache pool / python heap overhead (absorbed by enforcer's hard
         threshold margin — see MemorySettings.hard_threshold).
 
-        MLX SDPA only uses fused full-attention kernels for the head dimensions
-        supported by ``ScaledDotProductAttention::use_fallback``. Unsupported
-        prefill chunks fall back to an unfused fp32 score matrix whose K
+        MLX SDPA uses its fused full-attention kernels only for shapes accepted
+        by ``ScaledDotProductAttention::use_fallback``. Other prefill chunks
+        fall back to an unfused score matrix whose K
         dimension spans the full key/value context. With prefix-cache hits,
         that context is ``new_tokens + cached_tokens``, not just the new suffix.
         Passing only ``new_tokens`` here silently under-counts long-context
@@ -909,6 +942,10 @@ def _pos_int(v: Any) -> bool:
     return isinstance(v, int) and not isinstance(v, bool) and v > 0
 
 
+def _nonnegative_int(v: Any) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool) and v >= 0
+
+
 @dataclass(frozen=True)
 class _DeepSeekV4PrefillMemoryProfile:
     """Exact-shape prefill estimator for DeepSeek V4's hybrid attention.
@@ -1047,14 +1084,7 @@ class _DeepSeekV4PrefillMemoryProfile:
         # conservative bound for the unfused MLX path.
         topk_workspace = 6 * reduced_scores
         selected = query_tokens * min(self.index_topk, pooled_tokens) * 4
-        return (
-            query
-            + keys
-            + weights
-            + materialized_scores
-            + topk_workspace
-            + selected
-        )
+        return query + keys + weights + materialized_scores + topk_workspace + selected
 
     def _indexer_native_bytes(self, query_tokens: int, pooled_tokens: int) -> int:
         """Bound the fused native indexer score and deterministic top-k path."""
@@ -1263,8 +1293,9 @@ _ROTATING_CACHE_CLASS_NAMES = frozenset(
 )
 # Fixed-state recurrent caches (GDN/Mamba). Matches
 # Scheduler._cache_tree_has_arrays_cache plus mlx-lm's MambaCache.
-_ARRAYS_CACHE_CLASS_NAMES = frozenset(
-    {"ArraysCache", "SizedArraysCache", "MambaCache"}
+_ARRAYS_CACHE_CLASS_NAMES = frozenset({"ArraysCache", "SizedArraysCache", "MambaCache"})
+_FULL_KV_CACHE_CLASS_NAMES = frozenset(
+    {"QSAKVCache", "QSAQuantizedKVCache", "BatchQSAKVCache"}
 )
 
 
@@ -1295,7 +1326,7 @@ def collect_kv_layer_specs(
 
     def _walk(c: Any) -> None:
         nonlocal full, arrays
-        if type(c) is KVCache:
+        if type(c) is KVCache or type(c).__name__ in _FULL_KV_CACHE_CLASS_NAMES:
             full += 1
             return
         if isinstance(c, CacheList):
@@ -1323,6 +1354,48 @@ def collect_kv_layer_specs(
     return full, specs, arrays
 
 
+def estimate_qwen4_exp_kv_bytes_per_token(
+    config: Any,
+    cache_list: Any,
+    dtype_size: float,
+) -> float | None:
+    """Price Qwen4 QSA K/V plus its raw index keys and MRoPE positions."""
+    if not str(_cfg_get(config, "model_type", "")).startswith("qwen4_exp"):
+        return None
+    if cache_list is None:
+        return None
+
+    try:
+        qsa_layers = sum(
+            1
+            for cache in cache_list
+            if type(cache).__name__
+            in {"QSAKVCache", "QSAQuantizedKVCache", "BatchQSAKVCache"}
+        )
+    except Exception:
+        return None
+    if qsa_layers <= 0:
+        return None
+
+    num_kv_heads = _cfg_get(config, "num_key_value_heads")
+    head_dim = _cfg_get(config, "head_dim")
+    indexer_head_dim = _cfg_get(config, "indexer_head_dim")
+    if not all(_pos_int(value) for value in (num_kv_heads, head_dim, indexer_head_dim)):
+        return None
+    if not isinstance(dtype_size, (int, float)) or dtype_size <= 0:
+        return None
+
+    # QSA keeps ordinary K/V, one raw index-key vector, and up to three int64
+    # MRoPE coordinates for every cached token. Text-only positions use one
+    # coordinate, but charging all three keeps image requests conservative.
+    per_layer = (
+        2 * num_kv_heads * head_dim * float(dtype_size)
+        + indexer_head_dim * float(dtype_size)
+        + 3 * 8
+    )
+    return float(qsa_layers * per_layer)
+
+
 def estimate_mla_kv_bytes_per_token(
     config: Any,
     cache_list: Any,
@@ -1333,20 +1406,21 @@ def estimate_mla_kv_bytes_per_token(
     GLM/DeepSeek MLA models do not store expanded ``num_kv_heads * head_dim``
     K/V tensors. Their main cache stores a latent key and RoPE value
     (``kv_lora_rank + qk_rope_head_dim``) with a single KV head. GLM-5.2's DSA
-    indexer adds a second cache on full-indexer layers containing only
-    ``index_head_dim`` keys and zero-width values. Falling back to the standard
-    uniform KV formula over-counts GLM-5.2 by more than an order of magnitude.
+    indexer adds a second cache on full-indexer layers. GLM-5.2 stores one
+    ``index_head_dim`` key per token, while GLM-5.3 pools those keys by the
+    cache's compression ratio. Falling back to the standard uniform KV formula
+    over-counts these models by more than an order of magnitude.
     """
     kv_lora_rank = _cfg_get(config, "kv_lora_rank")
     rope_dim = _cfg_get(config, "qk_rope_head_dim")
-    if not (_pos_int(kv_lora_rank) and _pos_int(rope_dim)):
+    if not (_pos_int(kv_lora_rank) and _nonnegative_int(rope_dim)):
         return None
 
     if cache_list is None:
         return None
 
     main_cache_layers = 0
-    indexer_cache_layers = 0
+    indexer_cache_token_ratio = 0.0
     try:
         for layer_cache in cache_list:
             caches = getattr(layer_cache, "caches", None)
@@ -1356,7 +1430,11 @@ def estimate_mla_kv_bytes_per_token(
             if n_caches >= 1:
                 main_cache_layers += 1
             if n_caches >= 2:
-                indexer_cache_layers += 1
+                indexer_cache = caches[1]
+                ratio = getattr(indexer_cache, "ratio", 1)
+                if not _pos_int(ratio):
+                    ratio = 1
+                indexer_cache_token_ratio += 1.0 / ratio
     except Exception:
         return None
 
@@ -1369,7 +1447,7 @@ def estimate_mla_kv_bytes_per_token(
 
     elems_per_token = (
         main_cache_layers * (kv_lora_rank + rope_dim)
-        + indexer_cache_layers * index_head_dim
+        + indexer_cache_token_ratio * index_head_dim
     )
     return float(elems_per_token) * float(dtype_size)
 
@@ -1487,9 +1565,9 @@ def set_model_info_from_model(monitor: "MemoryMonitor", model: Any) -> None:
             except Exception:
                 pass
 
-        kv_bytes_per_token = estimate_mla_kv_bytes_per_token(
+        kv_bytes_per_token = estimate_qwen4_exp_kv_bytes_per_token(
             config, cache_list, dtype_size
-        )
+        ) or estimate_mla_kv_bytes_per_token(config, cache_list, dtype_size)
 
         # Truthiness alone isn't enough — MagicMock proxies leaking through the
         # descent (test scaffolds that don't fully spec ``model.config``) are
@@ -1609,7 +1687,10 @@ def raise_if_prefill_exceeds(
         request_id = f"preflight-{_uuid.uuid4().hex[:8]}"
     logger.warning(
         "Preflight rejected (%d tokens, cached=%d, request_id=%s): %s",
-        num_prompt_tokens, cached_tokens, request_id, message,
+        num_prompt_tokens,
+        cached_tokens,
+        request_id,
+        message,
     )
     raise PrefillMemoryExceededError(
         message=message,
