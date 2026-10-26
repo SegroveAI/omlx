@@ -23,20 +23,22 @@ struct SectionHeader<Trailing: View>: View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
             VStack(alignment: .leading, spacing: 2) {
                 Text(title)
-                    .font(.omlxText(11, weight: .semibold))
+                    .font(.omlxText(DesignTokens.FontSize.subheadline, weight: .semibold))
                     .foregroundStyle(theme.textSecondary)
                     .textCase(.uppercase)
                     .kerning(0.6)
                 if let subtitle, !subtitle.isEmpty {
                     Text(subtitle)
-                        .font(.omlxText(11))
+                        .font(.omlxText(DesignTokens.FontSize.subheadline))
                         .foregroundStyle(theme.textTertiary)
                 }
             }
             Spacer(minLength: 0)
             trailing
         }
-        .padding(.horizontal, 14)
+        // 28 = card gutter (14) + row inset (14): header text lines up with
+        // the row text inside the ListGroup below, like System Settings.
+        .padding(.horizontal, 28)
         .padding(.top, 14)
         .padding(.bottom, 6)
     }
@@ -56,7 +58,7 @@ extension SectionHeader where Trailing == EmptyView {
         SectionHeader("System", subtitle: "Apple Silicon · macOS 15.2")
         SectionHeader("Active Models") {
             Text("3 / 5")
-                .font(.omlxText(11))
+                .font(.omlxText(DesignTokens.FontSize.subheadline))
                 .foregroundStyle(.secondary)
         }
     }

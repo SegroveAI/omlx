@@ -16,6 +16,8 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from .virtual_nvfp4 import has_nvfp4_routed_experts
+
 logger = logging.getLogger(__name__)
 
 _VENDOR_MLX_VLM = Path(__file__).resolve().parent / "vendor" / "mlx_vlm"
@@ -24,6 +26,8 @@ _MINIMAX_ARCHITECTURES = {
     "MiniMaxM3ForCausalLM",
     "MiniMaxM3SparseForCausalLM",
 }
+
+_NVFP4_QUANTIZATION = {"group_size": 16, "bits": 4, "mode": "nvfp4"}
 
 _APPLIED = False
 _IGNORED_LAYER_STACK: list[tuple[str, ...]] = []
@@ -60,11 +64,11 @@ def is_applied() -> bool:
 def _install_vendor_namespace() -> None:
     import mlx_vlm
     import mlx_vlm.models
-    import mlx_vlm.tool_parsers
+    import mlx_vlm.tools.parsers
 
     _append_package_path(mlx_vlm, _VENDOR_MLX_VLM)
     _append_package_path(mlx_vlm.models, _VENDOR_MLX_VLM / "models")
-    _append_package_path(mlx_vlm.tool_parsers, _VENDOR_MLX_VLM / "tool_parsers")
+    _append_package_path(mlx_vlm.tools.parsers, _VENDOR_MLX_VLM / "tool_parsers")
 
 
 def _append_package_path(package: Any, path: Path) -> None:
@@ -73,7 +77,7 @@ def _append_package_path(package: Any, path: Path) -> None:
         return
     path_str = str(path)
     if path_str not in package_path:
-        package_path.append(path_str)
+        package_path.insert(0, path_str)
 
 
 def _import_vendor_modules() -> None:
@@ -83,7 +87,7 @@ def _import_vendor_modules() -> None:
         "mlx_vlm.models.minimax_m3_vl.processing_minimax_m3_vl",
         "mlx_vlm.models.minimax_m3_vl",
         "mlx_vlm.models.minimax_m3",
-        "mlx_vlm.tool_parsers.minimax_m3",
+        "mlx_vlm.tools.parsers.minimax_m3",
     ):
         importlib.import_module(module_name)
 
@@ -114,12 +118,12 @@ def _patch_get_model_and_args(vlm_utils: Any) -> None:
     if original is None or getattr(original, "_omlx_minimax_m3_compat", False):
         return
 
-    def patched_get_model_and_args(config: dict):
+    def patched_get_model_and_args(config: dict, model_path=None):
         raw_model_type = (
             config.get("model_type") if isinstance(config, dict) else None
         )
         if raw_model_type == "minimax_m3_vl":
-            module, model_type = original(config)
+            module, model_type = original(config, model_path=model_path)
             if model_type != "minimax_m3_vl":
                 module = importlib.import_module("mlx_vlm.models.minimax_m3_vl")
                 return module, "minimax_m3_vl"
@@ -132,8 +136,8 @@ def _patch_get_model_and_args(vlm_utils: Any) -> None:
         ):
             patched_config = dict(config)
             patched_config["model_type"] = "minimax_m3"
-            return original(patched_config)
-        return original(config)
+            return original(patched_config, model_path=model_path)
+        return original(config, model_path=model_path)
 
     patched_get_model_and_args._omlx_minimax_m3_compat = True
     patched_get_model_and_args._omlx_original = original
@@ -212,17 +216,17 @@ def _patch_process_inputs(vlm_utils: Any) -> None:
 
 
 def _patch_stopping_criteria(vlm_utils: Any) -> None:
-    original_cls = getattr(vlm_utils, "StoppingCriteria", None)
-    if original_cls is None or getattr(original_cls, "_omlx_minimax_m3_compat", False):
+    original_cls = vlm_utils.StoppingCriteria
+    if getattr(original_cls, "_omlx_minimax_m3_compat", False):
         return
 
     class PatchedStoppingCriteria(original_cls):
-        def __init__(self, eos_token_ids, tokenizer=None):
+        def __init__(
+            self, eos_token_ids, tokenizer=None, additional_eos_token_ids=None
+        ):
+            super().__init__(eos_token_ids, tokenizer, additional_eos_token_ids)
             if eos_token_ids is None:
-                self.eos_token_ids = []
-                self.tokenizer = tokenizer
-                return
-            super().__init__(eos_token_ids, tokenizer)
+                self.eos_token_ids = list(self.additional_eos_token_ids)
 
     PatchedStoppingCriteria.__name__ = original_cls.__name__
     PatchedStoppingCriteria.__qualname__ = original_cls.__qualname__
@@ -273,7 +277,36 @@ def _patch_load_config_and_model(vlm_utils: Any) -> None:
     vlm_utils.load_model = patched_load_model
 
 
+def adopt_expert_global_scales(config: dict[str, Any]) -> None:
+    """Route mlx-lm ``global_scale`` experts to the scaled MoE block.
+
+    mlx-lm marks NVFP4 experts with a per-expert global scale through
+    ``"global_scale": true`` in their quantization entry. The MoE block applies
+    those scales itself, so the flag is dropped on the mlx-vlm and mlx-lm load
+    paths alike. Left in, older mlx-lm rejects it in ``to_quantized`` and newer
+    mlx-lm adds a tensor scale that sanitize never fills. Other models keep it.
+    """
+    if not (
+        _is_minimax_model_type(config.get("model_type"))
+        or _has_minimax_architecture(config)
+    ):
+        return
+    flagged = False
+    for key in ("quantization", "quantization_config"):
+        quantization = config.get(key)
+        if not isinstance(quantization, dict):
+            continue
+        for spec in quantization.values():
+            if isinstance(spec, dict) and spec.pop("global_scale", False):
+                flagged = True
+    text_config = config.get("text_config")
+    if flagged and isinstance(text_config, dict):
+        text_config["pack_shared_expert"] = False
+        text_config["routed_expert_scales"] = True
+
+
 def _normalize_quantization_config(config: dict[str, Any]) -> None:
+    adopt_expert_global_scales(config)
     quantization_config = config.get("quantization_config")
     text_config = config.get("text_config")
     if quantization_config is None and isinstance(text_config, dict):
@@ -288,11 +321,24 @@ def _normalize_quantization_config(config: dict[str, Any]) -> None:
     if quant_method != "mxfp8" or "quantization" in config:
         return
 
-    config["quantization"] = {
-        "group_size": int(quantization_config.get("group_size") or 32),
-        "bits": int(quantization_config.get("bits") or 8),
-        "mode": "mxfp8",
-    }
+    # MLX mxfp8 only supports group size 32. M3.1 reports group_size 16 at the
+    # top level, which describes its NVFP4 routed experts instead.
+    quantization: dict[str, Any] = {"group_size": 32, "bits": 8, "mode": "mxfp8"}
+    text_config = config.get("text_config")
+    if has_nvfp4_routed_experts(config) and isinstance(text_config, dict):
+        # NVFP4 experts cannot share a stacked bank with the MXFP8 shared expert.
+        text_config["pack_shared_expert"] = False
+        text_config["routed_expert_scales"] = True
+        args = importlib.import_module(
+            "mlx_vlm.models.minimax_m3_vl.config"
+        ).TextConfig.from_dict(text_config)
+        for layer_idx in range(args.num_hidden_layers):
+            if not args.is_moe_layer(layer_idx):
+                continue
+            prefix = f"language_model.model.layers.{layer_idx}.block_sparse_moe"
+            for proj in ("gate_proj", "up_proj", "down_proj"):
+                quantization[f"{prefix}.switch_mlp.{proj}"] = dict(_NVFP4_QUANTIZATION)
+    config["quantization"] = quantization
 
 
 def _quantization_ignored_layers(config: Any) -> tuple[str, ...]:
@@ -370,6 +416,10 @@ def _patch_prompt_utils(prompt_utils: Any) -> None:
             **kwargs,
         ):
             if _is_minimax_model_type(model_name):
+                if isinstance(prompt, list):
+                    # The MiniMax template takes a string, so flatten ordered
+                    # text/image parts the way the formatter used to.
+                    prompt = prompt_utils.extract_text_from_content(prompt)
                 return _format_minimax_message(
                     prompt,
                     role,
@@ -447,6 +497,30 @@ def _config_model_type(config: Any) -> str | None:
     else:
         value = getattr(config, "model_type", None)
     return value if isinstance(value, str) else None
+
+
+# The release template is always adaptive and has no thinking_mode, but its
+# instructions still mark a disabled turn by the </mm:think> prefix and an
+# enabled one by <mm:think>. Its last output is the generation prompt, so this
+# block restores the prefixes the earlier template rendered for thinking_mode.
+_THINKING_MODE_PREFIX = (
+    "{%- if add_generation_prompt and thinking_mode is defined -%}"
+    "{%- if thinking_mode == 'disabled' -%}</mm:think>"
+    "{%- elif thinking_mode == 'enabled' -%}<mm:think>"
+    "{%- endif -%}"
+    "{%- endif -%}"
+)
+
+
+def minimax_thinking_mode_template(template: Any) -> Any:
+    """Return a MiniMax M3 chat template that renders ``thinking_mode``."""
+    if (
+        not isinstance(template, str)
+        or "<mm:think>" not in template
+        or "thinking_mode" in template
+    ):
+        return template
+    return template + _THINKING_MODE_PREFIX
 
 
 def _apply_minimax_thinking_kwargs(kwargs: dict[str, Any]) -> None:

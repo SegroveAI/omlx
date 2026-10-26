@@ -26,7 +26,9 @@
 // PR 6) the AppView shell can react without owning the lifecycle.
 
 import Foundation
+import AppKit
 import Darwin
+import IOKit
 
 struct AutoRestartBudget {
     let maxAttempts: Int
@@ -92,14 +94,18 @@ final class ServerProcess: @unchecked Sendable {
         case portConflict(PortConflict)
     }
 
-    enum StartError: Error, CustomStringConvertible {
+    enum StartError: Error, LocalizedError, CustomStringConvertible {
         case spawnFailed(String)
+        case invalidPort
 
         var description: String {
             switch self {
             case .spawnFailed(let m): return "Spawn failed: \(m)"
+            case .invalidPort: return "Port must be a number between 1 and 65535."
             }
         }
+
+        var errorDescription: String? { description }
     }
 
     static let stateDidChangeNotification = Notification.Name("OMLXServerProcessStateDidChange")
@@ -148,6 +154,7 @@ final class ServerProcess: @unchecked Sendable {
 
     private(set) var state: State = .stopped
     private var process: Process?
+    private(set) var startupNoticeURL: URL?
     private var logHandle: FileHandle?
     private var healthTask: Task<Void, Never>?
     private var consecutiveFailures = 0
@@ -188,8 +195,8 @@ final class ServerProcess: @unchecked Sendable {
     var serverLogURL: URL { logURL }
 
     /// Start the server. Returns .started on success, .alreadyRunning if
-    /// already up, or .portConflict if the port is busy. Throws only on
-    /// spawn-syscall failure.
+    /// already up, or .portConflict if the port is busy. Throws on invalid
+    /// persisted settings or spawn failure.
     @discardableResult
     func start() throws -> StartResult {
         switch state {
@@ -198,6 +205,17 @@ final class ServerProcess: @unchecked Sendable {
         default:
             break
         }
+
+        // Web settings may have changed since the previous child was launched.
+        let saved = try AppConfig.readSettings(basePath: basePath.path)
+        let env = ProcessInfo.processInfo.environment
+        let nextHost = env["OMLX_HOST"].flatMap { $0.isEmpty ? nil : $0 }
+            ?? saved.bindAddress ?? bindAddress
+        let nextPort = env["OMLX_PORT"].flatMap(Int.init) ?? saved.port ?? port
+        guard (1...65535).contains(nextPort) else {
+            throw StartError.invalidPort
+        }
+        try reconfigure(bindAddress: nextHost, port: nextPort)
 
         // Sync probe — fast enough on local connect refused.
         if resolver.isPortInUseSync() {
@@ -300,11 +318,12 @@ final class ServerProcess: @unchecked Sendable {
         let pid = proc.processIdentifier
         kill(pid, SIGTERM)
         let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if kill(pid, 0) != 0 { return }     // process gone
+        while Date() < deadline, kill(pid, 0) == 0 {
             usleep(100_000)                     // 100 ms
         }
-        kill(pid, SIGKILL)
+        if kill(pid, 0) == 0 { kill(pid, SIGKILL) }
+        // The app is quitting, so the async exit handler may never run.
+        removeLeftoverGPUPowerCap(serverPID: pid)
     }
 
     // MARK: - Internal — spawn
@@ -325,12 +344,16 @@ final class ServerProcess: @unchecked Sendable {
         let proc = Process()
         proc.executableURL = runtime.executable
         proc.arguments = makeArguments()
-        proc.environment = runtime.makeEnvironment()
+        // A per-launch notice keeps Python migration and the native alert in sync.
+        var environment = runtime.makeEnvironment()
+        let noticeURL = prepareStartupNotice()
+        environment["OMLX_STARTUP_NOTICE_PATH"] = noticeURL.path
+        proc.environment = environment
         proc.standardOutput = handle
         proc.standardError  = handle
         proc.terminationHandler = { [weak self] term in
             DispatchQueue.main.async {
-                self?.handleProcessExit(code: term.terminationStatus)
+                self?.handleProcessExit(code: term.terminationStatus, pid: term.processIdentifier)
             }
         }
 
@@ -346,11 +369,13 @@ final class ServerProcess: @unchecked Sendable {
         startHealthCheckLoop()
     }
 
-    private func handleProcessExit(code: Int32) {
+    private func handleProcessExit(code: Int32, pid: Int32) {
         let wasExpectingExit = expectingExit
         expectingExit = false
         process = nil
         closeLog()
+        removeLeftoverGPUPowerCap(serverPID: pid)
+        Task { @MainActor [weak self] in self?.presentStartupNotice() }
 
         if wasExpectingExit {
             update(.stopped)
@@ -365,6 +390,24 @@ final class ServerProcess: @unchecked Sendable {
         default:
             // Unexpected — log and stop.
             update(.stopped)
+        }
+    }
+
+    /// A killed server cannot remove its system-wide GPU power cap. While a
+    /// cap is set the server keeps this marker with its PID
+    /// (omlx/utils/gpu_power.py); a marker from another server is left alone.
+    private func removeLeftoverGPUPowerCap(serverPID: Int32) {
+        let marker = basePath.appendingPathComponent("gpu_power_cap.active")
+        guard let owner = try? String(contentsOf: marker, encoding: .utf8),
+              Int32(owner.trimmingCharacters(in: .whitespacesAndNewlines)) == serverPID
+        else { return }
+        let service = IOServiceGetMatchingService(
+            kIOMainPortDefault, IOServiceMatching("AGXAccelerator"))
+        guard service != 0 else { return }
+        defer { IOObjectRelease(service) }
+        let uncap: [String: Any] = ["SetMaxGPUAbsolutePower": true, "AbsoluteTarget": -1000]
+        if IORegistryEntrySetCFProperties(service, uncap as CFDictionary) == KERN_SUCCESS {
+            try? FileManager.default.removeItem(at: marker)
         }
     }
 
@@ -394,7 +437,8 @@ final class ServerProcess: @unchecked Sendable {
             guard case .starting = self.state else { return }
 
             do {
-                try self.doStart()
+                self.update(.stopped)
+                try self.start()
             } catch {
                 self.update(.failed(message: "Auto-restart failed: \(error)"))
             }
@@ -402,6 +446,41 @@ final class ServerProcess: @unchecked Sendable {
     }
 
     // MARK: - Internal — health check
+
+    func prepareStartupNotice() -> URL {
+        if let previous = startupNoticeURL {
+            try? FileManager.default.removeItem(at: previous)
+        }
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("omlx-startup-\(UUID().uuidString).txt")
+        startupNoticeURL = url
+        return url
+    }
+
+    @MainActor
+    func consumeStartupNotice() -> String? {
+        guard let url = startupNoticeURL,
+              let message = try? String(contentsOf: url, encoding: .utf8) else { return nil }
+        try? FileManager.default.removeItem(at: url)
+        startupNoticeURL = nil
+        bindAddress = "127.0.0.1"
+        resolver = PortConflictResolver(host: host, port: port)
+        NotificationCenter.default.post(name: Self.stateDidChangeNotification, object: self)
+        return message
+    }
+
+    @MainActor
+    private func presentStartupNotice() {
+        guard let message = consumeStartupNotice() else { return }
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Server access is now limited to this Mac"
+        alert.informativeText = message
+        alert.addButton(withTitle: "OK")
+        alert.window.level = .floating
+        alert.runModal()
+    }
 
     private func startHealthCheckLoop() {
         cancelHealthLoop()
@@ -428,6 +507,7 @@ final class ServerProcess: @unchecked Sendable {
             return
         }
 
+        presentStartupNotice()
         let probe = await resolver.probeHealth()
         let now = Date()
         switch state {

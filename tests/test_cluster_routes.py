@@ -5,6 +5,7 @@ import base64
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -16,6 +17,7 @@ from omlx.cluster.models import (
     RuntimeCapability,
     TransportState,
 )
+from omlx.exceptions import ModelBusyError
 
 
 def _status() -> ClusterStatus:
@@ -107,6 +109,7 @@ def _approval_for(payload: dict) -> str:
             execution_profile=payload.get("execution_profile", "balanced"),
             tensor_parallel_size=payload.get("tensor_parallel_size", 1),
             target_context_tokens=payload.get("target_context_tokens", 8192),
+            mtp=payload.get("mtp", False),
         )
     )
     return routes._placement_signature(plan.to_dict())
@@ -143,11 +146,13 @@ class _ReadyClusterPool:
         *,
         fail_canary: bool = False,
         remote_only: bool = False,
+        reload_busy: bool = False,
     ):
         self.model_path = model_path
         self.model_id = "public-model"
         self.fail_canary = fail_canary
         self.remote_only = remote_only
+        self.reload_busy = reload_busy
         self.cluster_registered = False
         self.entry = SimpleNamespace(engine=None)
         self.reloads = 0
@@ -168,6 +173,10 @@ class _ReadyClusterPool:
 
     def unregister_cluster_model(self, model_id):
         assert model_id == self.model_id
+        if self.entry.engine is not None:
+            raise RuntimeError(
+                f"cluster model '{model_id}' is still loaded and cannot be removed"
+            )
         self.cluster_registered = False
         return True
 
@@ -177,8 +186,11 @@ class _ReadyClusterPool:
 
     async def prepare_cluster_reload(self, model_id):
         assert model_id == self.model_id
+        if self.reload_busy and self.entry.engine is not None:
+            raise ModelBusyError(model_id, "activate distributed cluster")
         self.reloads += 1
         self.entry.engine = None
+        self.entry.pending_unload_reason = None
 
     async def get_engine(self, model_id):
         assert model_id == self.model_id
@@ -199,17 +211,33 @@ def _install_ready_pool(
     *,
     fail_canary=False,
     remote_only=False,
+    reload_busy=False,
 ):
     pool = _ReadyClusterPool(
         str(model_path),
         fail_canary=fail_canary,
         remote_only=remote_only,
+        reload_busy=reload_busy,
     )
     monkeypatch.setattr(routes, "_get_engine_pool", lambda: pool)
     # These route tests exercise activation after peer reachability has been
     # established. Do not let their synthetic ``studio.local`` host escape to
     # the real SSH liveness probe; peer-loss behavior has dedicated coverage.
     monkeypatch.setattr(routes, "check_peers", lambda *args, **kwargs: ())
+    pool.verified_teardowns = []
+    monkeypatch.setattr(
+        routes,
+        "stop_deployment_processes",
+        lambda deployment: (
+            pool.verified_teardowns.append(deployment.deployment_id)
+            or {
+                "verified": True,
+                "deployment_id": deployment.deployment_id,
+                "ranks_checked": deployment.world_size,
+                "manifest_retired": False,
+            }
+        ),
+    )
     return pool
 
 
@@ -522,7 +550,9 @@ def test_cluster_node_budgets_use_each_hosts_live_admission_ceiling(monkeypatch)
     assert studio["capacity_bytes"] < 223 * gib
 
 
-def test_cluster_node_budgets_let_the_probe_discover_an_unknown_interpreter(monkeypatch):
+def test_cluster_node_budgets_let_the_probe_discover_an_unknown_interpreter(
+    monkeypatch,
+):
     """#2680: sys.executable is the coordinator's bundled binary, not the peer's."""
 
     gib = 1024**3
@@ -608,9 +638,10 @@ def test_cluster_plan_route_builds_unequal_pipeline():
     assert payload["assignments"][0]["layer_count"] == 54
     assert payload["assignments"][1]["node_id"] == "mobile"
     assert payload["assignments"][1]["layer_count"] == 26
-    assert [
-        item["memory_guard_tier"] for item in payload["assignments"]
-    ] == ["aggressive", "safe"]
+    assert [item["memory_guard_tier"] for item in payload["assignments"]] == [
+        "aggressive",
+        "safe",
+    ]
 
 
 def test_cluster_plan_route_requires_exactly_one_model_source():
@@ -659,6 +690,36 @@ def test_cluster_plan_route_uses_downloaded_model_headers(monkeypatch):
 
     assert response.status_code == 200
     assert response.json()["model"]["source"] == "/models/example"
+
+
+def test_new_cluster_plans_follow_the_saved_lightning_mtp_setting(monkeypatch):
+    from omlx.cluster.planner import ModelLayout, PlanningError
+
+    head = ModelLayout("/models/draft", 0, (1,), mtp_weight_bytes=1)
+    plain = ModelLayout("/models/plain", 0, (1,))
+    saved = {}
+    pool = SimpleNamespace(
+        get_status=lambda: {
+            "models": [
+                {"id": "draft", "model_path": "/models/draft", "model_type": "llm"}
+            ]
+        }
+    )
+    manager = SimpleNamespace(
+        has_settings=lambda model_id: model_id in saved,
+        get_settings=lambda model_id: SimpleNamespace(mtp_enabled=saved[model_id]),
+    )
+    monkeypatch.setattr(routes, "_get_engine_pool", lambda: pool)
+    monkeypatch.setattr(routes, "_get_settings_manager", lambda: manager)
+
+    # Like a single Mac, a checkpoint with a head starts with MTP on.
+    assert routes._cluster_mtp(None, head, "/models/draft") is True
+    saved["draft"] = False
+    assert routes._cluster_mtp(None, head, "/models/draft") is False
+    assert routes._cluster_mtp(True, head, "/models/draft") is True
+    assert routes._cluster_mtp(None, plain, "/models/plain") is False
+    with pytest.raises(PlanningError, match="no Lightning MTP head"):
+        routes._cluster_mtp(True, plain, None)
 
 
 def test_cluster_plan_context_changes_kv_memory_and_signed_placement(monkeypatch):
@@ -823,28 +884,28 @@ def test_cluster_deployment_recomputes_plan_and_preflights(tmp_path, monkeypatch
     )
 
     body = {
-            "deployment_id": "nemotron-pool",
-            "model_path": str(model_path),
-            "backend": "jaccl",
-            "nodes": [
-                {"node_id": "large", "capacity_bytes": 100, "reserve_bytes": 10},
-                {"node_id": "small", "capacity_bytes": 60, "reserve_bytes": 10},
-            ],
-            "hosts": [
-                {
-                    "node_id": "large",
-                    "ssh": "127.0.0.1",
-                    "ips": ["192.168.5.1"],
-                    "rdma": [None, "rdma_en5"],
-                },
-                {
-                    "node_id": "small",
-                    "ssh": "studio.local",
-                    "ips": ["192.168.5.2"],
-                    "rdma": ["rdma_en5", None],
-                },
-            ],
-        }
+        "deployment_id": "nemotron-pool",
+        "model_path": str(model_path),
+        "backend": "jaccl",
+        "nodes": [
+            {"node_id": "large", "capacity_bytes": 100, "reserve_bytes": 10},
+            {"node_id": "small", "capacity_bytes": 60, "reserve_bytes": 10},
+        ],
+        "hosts": [
+            {
+                "node_id": "large",
+                "ssh": "127.0.0.1",
+                "ips": ["192.168.5.1"],
+                "rdma": [None, "rdma_en5"],
+            },
+            {
+                "node_id": "small",
+                "ssh": "studio.local",
+                "ips": ["192.168.5.2"],
+                "rdma": ["rdma_en5", None],
+            },
+        ],
+    }
     body["approved_placement"] = _approval_for(body)
     response = _client().post("/admin/api/cluster/deployments", json=body)
 
@@ -865,15 +926,36 @@ def test_cluster_deployment_recomputes_plan_and_preflights(tmp_path, monkeypatch
     assert pool.reloads == 1
     assert len(payload["preflight"]) == 2
     assert payload["performance_probe"]["status"] in {"applied", "placement_locked"}
-    assert (
-        payload["plan"]["placement_signature"]
-        == body["approved_placement"]
-    )
+    assert payload["plan"]["placement_signature"] == body["approved_placement"]
     assert payload["deployment"]["execution"]["profile"] == "balanced"
 
     listed = _client().get("/admin/api/cluster/deployments")
     assert listed.status_code == 200
     assert listed.json()["deployments"][0]["deployment_id"] == "nemotron-pool"
+
+    unloaded = _client().post("/admin/api/cluster/deployments/nemotron-pool/unload")
+    assert unloaded.status_code == 200, unloaded.json()
+    assert unloaded.json()["configured"] is True
+    assert unloaded.json()["stopped"] is True
+    assert unloaded.json()["teardown"]["verified"] is True
+    assert pool.verified_teardowns == ["nemotron-pool"]
+    assert pool.entry.engine is None
+    assert routes.get_cluster_registry().get("nemotron-pool") is not None
+
+    loaded = _client().post("/admin/api/cluster/deployments/nemotron-pool/load")
+    assert loaded.status_code == 200, loaded.json()
+    assert loaded.json()["loaded"] is True
+    assert loaded.json()["canary_completion_tokens"] == 1
+    assert len(loaded.json()["ranks"]) == 2
+    assert pool.entry.engine is not None
+
+    # Verify reload succeeds even if entry has a stuck pending_unload_reason
+    pool.entry.pending_unload_reason = "drain timeout"
+    pool.reloads = 0
+    loaded_again = _client().post("/admin/api/cluster/deployments/nemotron-pool/load")
+    assert loaded_again.status_code == 200, loaded_again.json()
+    assert pool.reloads == 1
+    assert pool.entry.pending_unload_reason is None
 
     removed = _client().delete("/admin/api/cluster/deployments/nemotron-pool")
     assert removed.status_code == 200
@@ -915,26 +997,26 @@ def test_cluster_deployment_keeps_memory_plan_when_benchmark_is_unavailable(
     )
 
     body = {
-            "deployment_id": "fallback-pool",
-            "model_path": str(model_path),
-            "backend": "ring",
-            "nodes": [
-                {"node_id": "large", "capacity_bytes": 100, "reserve_bytes": 10},
-                {"node_id": "small", "capacity_bytes": 60, "reserve_bytes": 10},
-            ],
-            "hosts": [
-                {
-                    "node_id": "large",
-                    "ssh": "127.0.0.1",
-                    "ips": ["10.0.0.1"],
-                },
-                {
-                    "node_id": "small",
-                    "ssh": "studio.local",
-                    "ips": ["10.0.0.2"],
-                },
-            ],
-        }
+        "deployment_id": "fallback-pool",
+        "model_path": str(model_path),
+        "backend": "ring",
+        "nodes": [
+            {"node_id": "large", "capacity_bytes": 100, "reserve_bytes": 10},
+            {"node_id": "small", "capacity_bytes": 60, "reserve_bytes": 10},
+        ],
+        "hosts": [
+            {
+                "node_id": "large",
+                "ssh": "127.0.0.1",
+                "ips": ["10.0.0.1"],
+            },
+            {
+                "node_id": "small",
+                "ssh": "studio.local",
+                "ips": ["10.0.0.2"],
+            },
+        ],
+    }
     body["approved_placement"] = _approval_for(body)
     response = _client().post("/admin/api/cluster/deployments", json=body)
 
@@ -945,7 +1027,12 @@ def test_cluster_deployment_keeps_memory_plan_when_benchmark_is_unavailable(
     assert payload["deployment"]["performance_profiles"] == []
 
 
-def test_cluster_activation_rolls_back_when_canary_fails(tmp_path, monkeypatch):
+# reload_busy: rank telemetry still counts the failed canary, so the rollback
+# cannot unload the engine. The canary error must still reach the caller.
+@pytest.mark.parametrize("reload_busy", [False, True])
+def test_cluster_activation_rolls_back_when_canary_fails(
+    tmp_path, monkeypatch, reload_busy
+):
     from omlx.cluster.planner import ModelLayout
     from omlx.cluster.registry import configure_cluster_registry
 
@@ -956,6 +1043,7 @@ def test_cluster_activation_rolls_back_when_canary_fails(tmp_path, monkeypatch):
         monkeypatch,
         model_path,
         fail_canary=True,
+        reload_busy=reload_busy,
     )
     monkeypatch.setattr(
         routes,
@@ -974,35 +1062,36 @@ def test_cluster_activation_rolls_back_when_canary_fails(tmp_path, monkeypatch):
     )
 
     body = {
-            "deployment_id": "canary-failure",
-            "model_path": str(model_path),
-            "backend": "ring",
-            "auto_tune": False,
-            "nodes": [
-                {"node_id": "large", "capacity_bytes": 100, "reserve_bytes": 10},
-                {"node_id": "small", "capacity_bytes": 60, "reserve_bytes": 10},
-            ],
-            "hosts": [
-                {
-                    "node_id": "large",
-                    "ssh": "127.0.0.1",
-                    "ips": ["10.0.0.1"],
-                },
-                {
-                    "node_id": "small",
-                    "ssh": "studio.local",
-                    "ips": ["10.0.0.2"],
-                },
-            ],
-        }
+        "deployment_id": "canary-failure",
+        "model_path": str(model_path),
+        "backend": "ring",
+        "auto_tune": False,
+        "nodes": [
+            {"node_id": "large", "capacity_bytes": 100, "reserve_bytes": 10},
+            {"node_id": "small", "capacity_bytes": 60, "reserve_bytes": 10},
+        ],
+        "hosts": [
+            {
+                "node_id": "large",
+                "ssh": "127.0.0.1",
+                "ips": ["10.0.0.1"],
+            },
+            {
+                "node_id": "small",
+                "ssh": "studio.local",
+                "ips": ["10.0.0.2"],
+            },
+        ],
+    }
     body["approved_placement"] = _approval_for(body)
     response = _client().post("/admin/api/cluster/deployments", json=body)
 
     assert response.status_code == 503
     assert "canary failure" in response.json()["detail"]
     assert registry.list() == ()
-    assert pool.entry.engine is None
-    assert pool.reloads == 2
+    if not reload_busy:
+        assert pool.entry.engine is None
+        assert pool.reloads == 2
 
 
 def test_cluster_deployment_rejects_unsafe_ssh_target(tmp_path, monkeypatch):
@@ -1022,25 +1111,25 @@ def test_cluster_deployment_rejects_unsafe_ssh_target(tmp_path, monkeypatch):
     )
 
     body = {
-            "model_path": str(tmp_path / "model"),
-            "backend": "ring",
-            "nodes": [
-                {"node_id": "local", "capacity_bytes": 10},
-                {"node_id": "peer", "capacity_bytes": 10},
-            ],
-            "hosts": [
-                {
-                    "node_id": "local",
-                    "ssh": "127.0.0.1",
-                    "ips": ["10.0.0.1"],
-                },
-                {
-                    "node_id": "peer",
-                    "ssh": "peer.local; bad",
-                    "ips": ["10.0.0.2"],
-                },
-            ],
-        }
+        "model_path": str(tmp_path / "model"),
+        "backend": "ring",
+        "nodes": [
+            {"node_id": "local", "capacity_bytes": 10},
+            {"node_id": "peer", "capacity_bytes": 10},
+        ],
+        "hosts": [
+            {
+                "node_id": "local",
+                "ssh": "127.0.0.1",
+                "ips": ["10.0.0.1"],
+            },
+            {
+                "node_id": "peer",
+                "ssh": "peer.local; bad",
+                "ips": ["10.0.0.2"],
+            },
+        ],
+    }
     body["approved_placement"] = _approval_for(body)
     response = _client().post("/admin/api/cluster/deployments", json=body)
 
@@ -1192,9 +1281,7 @@ def test_pairing_token_route_authenticates_with_the_shared_secret():
     assert rejected.json() == {"valid": False}
 
 
-def test_cuda_join_command_is_single_use_pinned_and_not_cached(
-    monkeypatch, tmp_path
-):
+def test_cuda_join_command_is_single_use_pinned_and_not_cached(monkeypatch, tmp_path):
     from omlx.cluster import ssh_keys
 
     store = ClusterEnrollmentStore(tmp_path)
@@ -1226,9 +1313,10 @@ def test_cuda_join_command_is_single_use_pinned_and_not_cached(
     assert payload["controller_key_fingerprint"] == fingerprint
     assert payload["single_use"] is True
     assert payload["expires_at"] - payload["created_at"] == 30 * 60
-    assert '"join_key":' not in _enrollment_client().get(
-        "/admin/api/cluster/join-status"
-    ).text
+    assert (
+        '"join_key":'
+        not in _enrollment_client().get("/admin/api/cluster/join-status").text
+    )
 
 
 def test_cuda_join_command_only_accepts_a_private_ipv4_controller():
@@ -1242,9 +1330,7 @@ def test_cuda_join_command_only_accepts_a_private_ipv4_controller():
         assert "controller" in response.json()["detail"]
 
 
-def test_cuda_worker_claim_replay_and_completion_fail_closed(
-    monkeypatch, tmp_path
-):
+def test_cuda_worker_claim_replay_and_completion_fail_closed(monkeypatch, tmp_path):
     from omlx.cluster import ssh_keys
 
     store = ClusterEnrollmentStore(tmp_path)
@@ -1260,11 +1346,14 @@ def test_cuda_worker_claim_replay_and_completion_fail_closed(
         lambda: SimpleNamespace(public_key=public_key, fingerprint=fingerprint),
     )
     pinned = []
-    monkeypatch.setattr(
-        ssh_keys,
-        "pin_enrolled_host_key",
-        lambda **kwargs: pinned.append(kwargs),
-    )
+    pin_failures = []
+
+    def pin(**kwargs):
+        if pin_failures:
+            raise RuntimeError(pin_failures.pop())
+        pinned.append(kwargs)
+
+    monkeypatch.setattr(ssh_keys, "pin_enrolled_host_key", pin)
     raw_key, _ = store.issue_join_key(
         controller_url="http://10.42.0.10:8000",
         source_digest="b" * 64,
@@ -1312,6 +1401,17 @@ def test_cuda_worker_claim_replay_and_completion_fail_closed(
     assert "identity changed" in changed.json()["detail"]
     assert pinned == []
 
+    # A refused pin must leave nothing enrolled and the session retryable.
+    pin_failures.append("refusing changed SSH host key")
+    refused = client.post(
+        "/cluster/join/complete",
+        json=completion,
+        headers={"Authorization": f"Bearer {session}"},
+    )
+    assert refused.status_code == 400
+    assert "changed SSH host key" in refused.json()["detail"]
+    assert client.get("/admin/api/cluster/join-status").json()["nodes"] == []
+
     completed = client.post(
         "/cluster/join/complete",
         json=completion,
@@ -1342,9 +1442,10 @@ def test_cuda_worker_completion_refuses_a_forged_host_fingerprint(
             fingerprint=ssh_keys.ssh_public_key_fingerprint(controller_key),
         ),
     )
-    worker_key = "ssh-ed25519 " + base64.b64encode(
-        b"worker-host-key-material-long-enough"
-    ).decode()
+    worker_key = (
+        "ssh-ed25519 "
+        + base64.b64encode(b"worker-host-key-material-long-enough").decode()
+    )
     raw_key, _ = store.issue_join_key(
         controller_url="http://10.42.0.10:8000",
         source_digest="b" * 64,
@@ -1659,6 +1760,87 @@ def test_a_thunderbolt_pair_without_rdma_falls_back_to_the_ring_out_loud(monkeyp
     assert "studio.local" in body["backend_reason"]
     assert "ring" in body["backend_reason"]
     assert all(host["rdma"] == [] for host in body["hosts"])
+    (warning,) = body["warnings"]
+    assert warning.startswith("The cluster uses the TCP ring instead of JACCL")
+    assert "studio.local reports no RDMA device" in warning
+
+
+_RDMA_MAC_PORTS = """\
+Hardware Port: Wi-Fi
+Device: en1
+
+Hardware Port: Thunderbolt 1
+Device: en2
+
+Hardware Port: Thunderbolt Bridge
+Device: bridge0
+"""
+_IBV_DEVICES = """\
+    device                 node GUID
+    ------              ----------------
+    rdma_en2            0000000000000000
+"""
+
+
+def _rdma_mac_ifconfig(index, *, on_bridge):
+    """ifconfig -a of a Mac with RDMA on and a Thunderbolt cable in en2."""
+
+    port = "" if on_bridge else f"\tinet 192.168.0.{index} netmask 0xfffffffc\n"
+    bridge = f"\tinet 10.10.0.{index} netmask 0xffffff00\n" if on_bridge else ""
+    flags = "8863<UP,BROADCAST,RUNNING,MULTICAST>" if on_bridge else "8822<BROADCAST>"
+    return (
+        "en2: flags=8963<UP,BROADCAST,SMART,RUNNING,PROMISC,SIMPLEX,MULTICAST>\n"
+        f"\tstatus: active\n{port}"
+        f"bridge0: flags={flags} mtu 1500\n"
+        f"\tmember: en2 flags=3<LEARNING,DISCOVER>\n{bridge}"
+    )
+
+
+@pytest.mark.parametrize("on_bridge", [True, False])
+def test_rdma_needs_the_thunderbolt_port_addressed_not_the_bridge(
+    monkeypatch, on_bridge
+):
+    """The reporter's layout falls back out loud; MLX's own layout runs JACCL."""
+
+    from omlx.cluster import transport
+
+    readings = {
+        host: _rdma_mac_ifconfig(index, on_bridge=on_bridge)
+        for index, host in enumerate(("127.0.0.1", "studio.local"), start=1)
+    }
+    monkeypatch.setattr(
+        transport,
+        "_read",
+        lambda host, command: (
+            readings[host] if command[0] == "ifconfig" else _RDMA_MAC_PORTS
+        ),
+    )
+    # Only the RDMA device probe still runs a command.
+    monkeypatch.setattr(
+        transport.subprocess,
+        "run",
+        lambda command, **_: SimpleNamespace(
+            returncode=0, stdout=_IBV_DEVICES, stderr=""
+        ),
+    )
+    monkeypatch.setattr(
+        routes, "verify_link_reachability", lambda link: (True, link.reason)
+    )
+
+    body = (
+        _client()
+        .get("/admin/api/cluster/fabric", params={"hosts": "127.0.0.1,studio.local"})
+        .json()
+    )
+
+    if on_bridge:
+        assert body["backend"] == "ring" and body["fell_back"] is True
+        (warning,) = body["warnings"]
+        assert "over bridge0, which is not an RDMA device" in warning
+        assert "Turn the Thunderbolt Bridge off" in warning
+    else:
+        assert body["backend"] == "jaccl" and body["warnings"] == []
+        assert body["rdma"]["rows"] == [[None, "rdma_en2"], ["rdma_en2", None]]
 
 
 def test_macs_that_share_no_subnet_get_no_address_and_a_reason(monkeypatch):
@@ -1679,6 +1861,54 @@ def test_macs_that_share_no_subnet_get_no_address_and_a_reason(monkeypatch):
     assert not body["ok"]
     assert all(host["ips"] == [] for host in body["hosts"])
     assert "share no subnet" in body["backend_reason"]
+
+
+def test_a_thunderbolt_cable_the_cluster_cannot_use_is_named_before_activation(
+    monkeypatch,
+):
+    from dataclasses import replace
+
+    def mac(name, address):
+        return replace(
+            _interfaces(name, [("en1", address, 24)], thunderbolt={"bridge0"}),
+            wifi_interfaces=frozenset({"en1"}),
+            self_assigned_interfaces=frozenset({"bridge0"}),
+        )
+
+    _readings(
+        monkeypatch,
+        {
+            "127.0.0.1": mac("127.0.0.1", "192.168.4.21"),
+            "studio.local": mac("studio.local", "192.168.4.22"),
+        },
+    )
+    monkeypatch.setattr(routes, "detect_cluster_transports", lambda hosts: _no_links())
+    monkeypatch.setattr(routes, "probe_remote_host", lambda ssh, **_: None)
+
+    proposal = (
+        _client()
+        .post(
+            "/admin/api/cluster/autoconfigure",
+            json={
+                "model_size_bytes": 40 * 1024**3,
+                "layer_count": 32,
+                "nodes": [
+                    {"node_id": f"node-{index}", "capacity_bytes": 64 * 1024**3}
+                    for index in range(2)
+                ],
+                "hosts": [
+                    {"node_id": "node-0", "ssh": "127.0.0.1", "ips": ["10.0.0.1"]},
+                    {"node_id": "node-1", "ssh": "studio.local", "ips": ["10.0.0.2"]},
+                ],
+            },
+        )
+        .json()
+    )
+
+    # The cluster still runs, over Wi-Fi, and says what to fix first.
+    assert proposal["backend"] == "ring"
+    (warning,) = [w for w in proposal["warnings"] if "169.254" in w]
+    assert "self-assigned 169.254" in warning and "Wi-Fi" in warning
 
 
 def test_one_host_is_not_a_fabric():
@@ -1788,6 +2018,60 @@ def test_autoconfigure_activates_on_discovered_addresses_not_supplied_ones(
         [None, "rdma_en4"],
         ["rdma_en5", None],
     ]
+
+
+def test_autoconfigure_lightning_mtp_plan_is_the_one_activation_recomputes(
+    monkeypatch,
+):
+    from omlx.cluster.planner import ModelLayout
+
+    gib = 1024**3
+    monkeypatch.setattr(
+        routes,
+        "inspect_safetensors_layout",
+        lambda path: ModelLayout(
+            source=path,
+            fixed_weight_bytes=gib,
+            layer_weight_bytes=(2 * gib,) * 8,
+            supports_pipeline=True,
+            mtp_weight_bytes=gib,
+        ),
+    )
+    _readings(
+        monkeypatch,
+        {
+            "127.0.0.1": _interfaces("127.0.0.1", [("en4", "10.0.1.1", 30)]),
+            "studio.local": _interfaces("studio.local", [("en5", "10.0.1.2", 30)]),
+        },
+    )
+    monkeypatch.setattr(routes, "detect_cluster_transports", lambda hosts: _no_links())
+    monkeypatch.setattr(routes, "probe_remote_host", lambda ssh, **_: None)
+
+    body = (
+        _client()
+        .post(
+            "/admin/api/cluster/autoconfigure",
+            json={
+                "model_path": "/models/draft",
+                "strategy": "pipeline",
+                "mtp": True,
+                "nodes": [
+                    {"node_id": f"node-{index}", "capacity_bytes": 64 * gib}
+                    for index in range(2)
+                ],
+                "hosts": [
+                    {"node_id": "node-0", "ssh": "127.0.0.1", "ips": ["10.0.1.1"]},
+                    {"node_id": "node-1", "ssh": "studio.local", "ips": ["10.0.1.2"]},
+                ],
+            },
+        )
+        .json()
+    )
+
+    activation = body["activation"]
+    assert activation["mtp"] is True
+    # Placing ranks rebuilds the plan; it must still carry the head.
+    assert activation["approved_placement"] == _approval_for(activation)
 
 
 def test_autoconfigure_uses_verified_ethernet_when_rdma_is_unreachable(
@@ -2037,8 +2321,7 @@ def test_cuda_fabric_verification_is_a_gui_api_and_uses_live_peer_facts(monkeypa
         ("192.168.100.2", "192.168.101.2"),
     ]
     assert all(
-        host.interfaces == ("enp1s0f0np0", "enp2s0f0np0")
-        for host in captured["hosts"]
+        host.interfaces == ("enp1s0f0np0", "enp2s0f0np0") for host in captured["hosts"]
     )
 
 
@@ -2283,3 +2566,173 @@ def test_peer_health_transition_records_one_incident(tmp_path, monkeypatch):
     fresh = "/admin/api/cluster/peer-health?hosts=studio.local&deployment_id=d2"
     assert client.get(fresh).json()["healthy"] is False
     assert len(store.list()) == 1
+
+
+@pytest.mark.parametrize("local_only", [False, True])
+def test_forget_cluster_with_unreachable_peer(monkeypatch, local_only):
+    from omlx.cluster.launch import DistributedTeardownError
+
+    deployment = SimpleNamespace(model="org/model", deployment_id="offline")
+    removed = []
+    prepared = []
+
+    class Pool:
+        def resolve_cluster_model_id(self, model):
+            return "model"
+
+        async def prepare_cluster_reload(self, model_id, **kwargs):
+            prepared.append(kwargs)
+
+        def unregister_cluster_model(self, model_id):
+            assert removed == ["offline"]
+
+    def stop(deployment, *, local_only=False):
+        if not local_only:
+            raise DistributedTeardownError("peer is unreachable")
+
+    monkeypatch.setattr(routes, "_engine_pool", lambda: Pool())
+    monkeypatch.setattr(
+        routes,
+        "get_cluster_registry",
+        lambda: SimpleNamespace(
+            get=lambda identifier: deployment,
+            remove=lambda identifier: removed.append(identifier) or True,
+        ),
+    )
+    monkeypatch.setattr(routes, "stop_deployment_processes", stop)
+    suffix = "?local_only=true" if local_only else ""
+    response = _client().delete("/admin/api/cluster/deployments/offline" + suffix)
+    assert response.status_code == (200 if local_only else 503)
+    assert removed == (["offline"] if local_only else [])
+    assert prepared == ([{"local_only": True}] if local_only else [{}])
+    if local_only:
+        assert response.json()["stopped"] is False
+        assert response.json()["local_only"] is True
+
+
+
+def test_forget_cluster_preserves_setup_when_local_stop_fails(monkeypatch):
+    from omlx.cluster.launch import DistributedTeardownError
+
+    deployment = SimpleNamespace(model="org/model", deployment_id="offline")
+    removed = []
+
+    class Pool:
+        def resolve_cluster_model_id(self, model):
+            return "model"
+
+        async def prepare_cluster_reload(self, model_id, **kwargs):
+            raise DistributedTeardownError("local worker survived")
+
+    monkeypatch.setattr(routes, "_engine_pool", lambda: Pool())
+    monkeypatch.setattr(
+        routes,
+        "get_cluster_registry",
+        lambda: SimpleNamespace(
+            get=lambda identifier: deployment,
+            remove=lambda identifier: removed.append(identifier),
+        ),
+    )
+    response = _client().delete(
+        "/admin/api/cluster/deployments/offline?local_only=true"
+    )
+    assert response.status_code == 503
+    assert removed == []
+
+
+@pytest.mark.parametrize("node_id", ["peer-a", None, "self"])
+def test_forget_member_preserves_other_pairings_or_leaves_cluster(monkeypatch, node_id):
+    from omlx.cluster import pairing_routes
+
+    peers = {"peer-a", "peer-b"}
+    placements = [
+        SimpleNamespace(
+            deployment_id="uses-a", hosts=[SimpleNamespace(node_id="peer-a")]
+        ),
+        SimpleNamespace(
+            deployment_id="uses-b", hosts=[SimpleNamespace(node_id="peer-b")]
+        ),
+    ]
+    stopped = []
+
+    async def stop(deployment_id, *, local_only):
+        assert local_only
+        stopped.append(deployment_id)
+
+    manager = SimpleNamespace(
+        node_id="self",
+        paired_devices=lambda: [{"node_id": node} for node in sorted(peers)],
+        unpair=lambda node: peers.remove(node),
+    )
+    monkeypatch.setattr(pairing_routes, "_manager", lambda: manager)
+    monkeypatch.setattr(
+        routes, "get_cluster_registry", lambda: SimpleNamespace(list=lambda: placements)
+    )
+    monkeypatch.setattr(routes, "deactivate_cluster_deployment", stop)
+    app = FastAPI()
+    app.include_router(routes.router)
+    suffix = "" if node_id is None else f"?node_id={node_id}"
+    response = TestClient(app).delete("/admin/api/cluster/forget" + suffix)
+    assert response.status_code == 200
+    assert response.json()["stopped"] is False
+    if node_id == "peer-a":
+        assert peers == {"peer-b"}
+        assert stopped == ["uses-a"]
+    else:
+        assert peers == set()
+        assert stopped == ["uses-a", "uses-b"]
+
+
+@pytest.mark.parametrize("status", [409, 503])
+def test_forget_member_does_not_unpair_when_local_teardown_fails(monkeypatch, status):
+    from fastapi import HTTPException
+    from omlx.cluster import pairing_routes
+
+    removed = []
+    manager = SimpleNamespace(
+        node_id="self",
+        paired_devices=lambda: [{"node_id": "offline"}],
+        unpair=removed.append,
+    )
+    deployment = SimpleNamespace(
+        deployment_id="model", hosts=[SimpleNamespace(node_id="offline")]
+    )
+
+    async def stop(*args, **kwargs):
+        raise HTTPException(status_code=status, detail="local teardown blocked")
+
+    monkeypatch.setattr(pairing_routes, "_manager", lambda: manager)
+    monkeypatch.setattr(
+        routes,
+        "get_cluster_registry",
+        lambda: SimpleNamespace(list=lambda: [deployment]),
+    )
+    monkeypatch.setattr(routes, "deactivate_cluster_deployment", stop)
+    app = FastAPI()
+    app.include_router(routes.router)
+    assert (
+        TestClient(app).delete("/admin/api/cluster/forget?node_id=offline").status_code
+        == status
+    )
+    assert not removed
+
+
+def test_forget_member_maps_pairing_errors(monkeypatch):
+    from omlx.cluster import pairing_routes
+    from omlx.cluster.pairing import PairingStateError
+
+    def unpair(node):
+        raise PairingStateError("approval is already in progress")
+
+    manager = SimpleNamespace(
+        node_id="self", paired_devices=lambda: [{"node_id": "busy"}], unpair=unpair
+    )
+    monkeypatch.setattr(pairing_routes, "_manager", lambda: manager)
+    monkeypatch.setattr(
+        routes, "get_cluster_registry", lambda: SimpleNamespace(list=lambda: [])
+    )
+    app = FastAPI()
+    app.include_router(routes.router)
+    response = TestClient(app).delete("/admin/api/cluster/forget?node_id=busy")
+    assert response.status_code == 404
+    assert response.json()["detail"] == "approval is already in progress"

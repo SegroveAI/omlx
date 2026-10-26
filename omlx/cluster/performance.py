@@ -9,6 +9,8 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any, Literal
 
+from ..model_settings import MAX_LIGHTNING_MTP_DRAFT_TOKENS
+
 ExecutionProfileName = Literal["interactive", "balanced", "throughput"]
 
 _MAX_RATE = 1e18
@@ -166,10 +168,16 @@ class ExecutionSettings:
     # per-layer state cannot be sliced (rotating window, gated-delta-net) still
     # reuses a long prefix across requests instead of recomputing it.
     prompt_cache_ssd: bool = True
+    prompt_cache_ssd_max_bytes: int = 20 * 1024**3
     sampling_rank_only: bool = True
     async_overlap: bool = True
     ring_connections_per_ip: int = 2
     tuning_reason: str = "balanced profile defaults"
+    # Lightning MTP. Rank zero drafts and decides; the plan reserves the head
+    # there. A depth of 0 keeps the model family's default.
+    mtp: bool = False
+    mtp_depth: int = 0
+    mtp_fixed_depth: bool = False
 
     def __post_init__(self) -> None:
         if self.profile not in {"interactive", "balanced", "throughput"}:
@@ -181,6 +189,7 @@ class ExecutionSettings:
             "prompt_cache_size",
             "pipeline_microbatch_size",
             "ring_connections_per_ip",
+            "prompt_cache_ssd_max_bytes",
         ):
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
@@ -203,6 +212,15 @@ class ExecutionSettings:
                 raise ValueError(f"{name} must be a positive integer when set")
         if not isinstance(self.tuning_reason, str) or not self.tuning_reason:
             raise ValueError("tuning_reason is required")
+        if (
+            not isinstance(self.mtp_depth, int)
+            or isinstance(self.mtp_depth, bool)
+            or not 0 <= self.mtp_depth <= MAX_LIGHTNING_MTP_DRAFT_TOKENS
+        ):
+            raise ValueError(
+                "mtp_depth must be an integer from 0 to "
+                f"{MAX_LIGHTNING_MTP_DRAFT_TOKENS}"
+            )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -217,10 +235,14 @@ class ExecutionSettings:
             "pipeline_microbatch_size": self.pipeline_microbatch_size,
             "cache_affinity": self.cache_affinity,
             "prompt_cache_ssd": self.prompt_cache_ssd,
+            "prompt_cache_ssd_max_bytes": self.prompt_cache_ssd_max_bytes,
             "sampling_rank_only": self.sampling_rank_only,
             "async_overlap": self.async_overlap,
             "ring_connections_per_ip": self.ring_connections_per_ip,
             "tuning_reason": self.tuning_reason,
+            "mtp": self.mtp,
+            "mtp_depth": self.mtp_depth,
+            "mtp_fixed_depth": self.mtp_fixed_depth,
         }
 
     @classmethod

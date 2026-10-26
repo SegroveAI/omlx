@@ -100,7 +100,6 @@ async def test_only_qwen4_exp_loader_defers_parameter_eval_to_materialize(
 
     monkeypatch.setattr(vlm_utils, "load", stop_after_load)
     monkeypatch.setattr(vlm_module, "_patch_video_processor_bug", lambda: None)
-    monkeypatch.setattr(vlm_module, "_patch_torch_free_image_processor", lambda: None)
     monkeypatch.setattr(vlm_module, "apply_pixtral_torch_free_patch", lambda: None)
     monkeypatch.setattr(
         model_loading, "maybe_apply_pre_load_patches", lambda *a, **k: None
@@ -135,7 +134,7 @@ def test_qwen4_exp_loader_enables_adaptive_depth_three_lightning_mtp(tmp_path):
         json.dumps({"weight_map": {"mtp.fc_hidden.weight": "model.safetensors"}}),
         encoding="utf-8",
     )
-    settings = SimpleNamespace(mtp_enabled=True, mtp_num_draft_tokens=None)
+    settings = SimpleNamespace(mtp_enabled=True, mtp_adaptive_max_depth=None)
 
     maybe_apply_pre_load_patches(str(tmp_path), settings, for_vlm=True)
 

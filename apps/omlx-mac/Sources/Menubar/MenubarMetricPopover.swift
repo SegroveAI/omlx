@@ -34,7 +34,7 @@ struct MetricPopoverView: View {
 
             if let note = statusNote {
                 Text(note)
-                    .font(.omlxText(11))
+                    .font(.omlxText(DesignTokens.FontSize.subheadline))
                     .foregroundStyle(theme.textTertiary)
             }
 
@@ -113,7 +113,7 @@ struct MetricPopoverView: View {
 
     private func sectionHeader(_ title: String) -> some View {
         Text(title.uppercased())
-            .font(.omlxText(10, weight: .bold))
+            .font(.omlxText(DesignTokens.FontSize.caption, weight: .bold))
             .kerning(1)
             .foregroundStyle(theme.accent)
             .frame(maxWidth: .infinity, alignment: .center)
@@ -125,11 +125,11 @@ struct MetricPopoverView: View {
                 .fill(tint)
                 .frame(width: 6, height: 6)
             Text(label)
-                .font(.omlxText(12, weight: .medium))
+                .font(.omlxText(DesignTokens.FontSize.callout, weight: .medium))
                 .foregroundStyle(theme.textSecondary)
             Spacer()
             Text(value)
-                .font(.omlxMono(12, weight: .medium))
+                .font(.omlxMono(DesignTokens.FontSize.callout, weight: .medium))
                 .foregroundStyle(theme.text)
         }
     }
@@ -206,12 +206,19 @@ struct MetricSparkline: View {
             let isFlat = span <= .ulpOfOne
             let stepX = size.width / CGFloat(values.count - 1)
 
+            // Inset the plot range by half the stroke width so a series
+            // pinned to the floor (0%) or ceiling doesn't center its stroke
+            // on the canvas edge and render half-clipped.
+            let lineWidth: CGFloat = 1.2
+            let plotTop = lineWidth / 2
+            let plotHeight = size.height - lineWidth
+
             var trace = Path()
             for (index, value) in values.enumerated() {
                 let normalized = isFlat ? 0.5 : (value - low) / span
                 let point = CGPoint(
                     x: CGFloat(index) * stepX,
-                    y: size.height * (1 - CGFloat(normalized))
+                    y: plotTop + plotHeight * (1 - CGFloat(normalized))
                 )
                 if index == 0 {
                     trace.move(to: point)
@@ -235,7 +242,7 @@ struct MetricSparkline: View {
             context.stroke(
                 trace,
                 with: .color(color),
-                style: StrokeStyle(lineWidth: 1.2, lineJoin: .round)
+                style: StrokeStyle(lineWidth: lineWidth, lineJoin: .round)
             )
         }
         .frame(height: height)

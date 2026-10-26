@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import gc
 import re
+import sys
 from collections.abc import Callable
 from contextlib import contextmanager
 from typing import Any
@@ -119,11 +121,38 @@ def progressive_sharded_load(
         tokenizer_config or {"trust_remote_code": trust_remote_code},
         eos_token_ids=metadata_config.get("eos_token_id", None),
     )
+    if pipeline_group is not None and tensor_group is not None:
+        raise ValueError(
+            "progressive loading does not combine pipeline and tensor groups"
+        )
+    # An architecture with its own checkpoint format loads its part itself.
+    own_format = sys.modules.get(f"mlx_lm.models.{metadata_config.get('model_type')}")
+    stage_loader = getattr(own_format, "load_pipeline_stage", None)
+    if stage_loader is not None:
+        if tensor_group is not None:
+            tensor_loader = getattr(own_format, "load_tensor_shard", None)
+            if tensor_loader is None:
+                raise ValueError("this model supports pipeline parallelism only")
+            model = tensor_loader(model_path, tensor_group)
+        else:
+            model = stage_loader(
+                model_path, pipeline_group or mx_module.distributed.init()
+            )
+        if return_config:
+            return model, tokenizer, metadata_config
+        return model, tokenizer
+    load_kwargs = {}
+    if metadata_config.get("model_type") == "muse_spark":
+        # Ranks serve text only; oMLX's class also reads its earlier layout.
+        from ..patches.muse_spark.model import load_kwargs as muse_spark_kwargs
+
+        load_kwargs = muse_spark_kwargs(model_path, text_only=True)
     model, config = utils_module.load_model(
         model_path,
         lazy=True,
         strict=False,
         trust_remote_code=trust_remote_code,
+        **load_kwargs,
     )
     has_pipeline = hasattr(model, "model") and hasattr(model.model, "pipeline")
     has_native_tensor = callable(getattr(model, "shard", None))
@@ -149,10 +178,6 @@ def progressive_sharded_load(
         )
     if not has_pipeline and not has_tensor and tensor_group is None:
         raise ValueError("The model does not support any sharding")
-    if pipeline_group is not None and tensor_group is not None:
-        raise ValueError(
-            "progressive loading does not combine pipeline and tensor groups"
-        )
     if pipeline_group is tensor_group is None:
         group = mx_module.distributed.init()
         if has_tensor:
@@ -184,6 +209,7 @@ def progressive_sharded_load(
         lazy=True,
         strict=False,
         trust_remote_code=trust_remote_code,
+        **load_kwargs,
     )
     if pipeline_group is not None:
         model.model.pipeline(pipeline_group)
@@ -217,6 +243,9 @@ def progressive_sharded_load(
             )
         _eval_values(mx_module, fixed)
         mx_module.clear_cache()
+        del flat, fixed
+        gc.collect()
+        mx_module.clear_cache()
         strategy = apply_tensor_strategy(
             model,
             tensor_group,
@@ -233,17 +262,18 @@ def progressive_sharded_load(
         ]
         _eval_values(mx_module, sharded_fixed)
         mx_module.clear_cache()
+        del sharded_fixed
+        gc.collect()
+        mx_module.clear_cache()
         if progress is not None:
             progress({"phase": "tensor_ready", "strategy": strategy})
 
-    # CPU synchronization avoids Metal watchdog timeouts while other ranks
-    # finish their last layer.
-    mx_module.eval(
-        mx_module.distributed.all_sum(
-            mx_module.array(1.0),
-            stream=mx_module.cpu,
-        )
-    )
+    # Do not add a final collective here. Every tensor above has already been
+    # materialized locally, and the launcher withholds the endpoint until it
+    # has received ``rank_ready`` from every member. A redundant CPU-stream
+    # all-reduce at peak wired-memory pressure can lose a JACCL completion and
+    # tear down an otherwise complete load. Rank markers are the load barrier;
+    # the first inference request cannot arrive before all of them are ready.
     if return_config:
         return model, tokenizer, config
     return model, tokenizer

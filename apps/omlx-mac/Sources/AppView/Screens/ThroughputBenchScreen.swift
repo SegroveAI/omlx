@@ -1,7 +1,7 @@
 // PR 14 — Throughput Bench screen.
 //
 // Mirrors the "Throughput Bench" tab from the HTML admin panel
-// (omlx/admin/templates/dashboard/_bench.html + dashboard.js benchmark
+// (apps/omlx-web/omlx_web/templates/dashboard/_bench.html + dashboard.js benchmark
 // section). Wires the /api/bench/* endpoints onto a stack of sections:
 //
 //   Header          — title + one-line description, matches the rest of
@@ -21,11 +21,11 @@
 //   Error banner    — red banner if the most recent call failed or the
 //                     server reported a terminal error.
 //
-//   Single Request  — table-style rows: Test, TTFT, TPOT, pp TPS, tg TPS,
+//   Single Request  — table-style rows: Test, TTFT, TPOT, PP TPS, TG TPS,
 //                     E2E, Throughput, Peak Mem. Only when there is at
 //                     least one single-result row.
 //
-//   Batch Results   — Batch, tg TPS, pp TPS, avg TTFT, E2E, Speedup.
+//   Batch Results   — Batch, TG TPS, PP TPS, avg TTFT, E2E, Speedup.
 //                     Adds a synthetic "1×" baseline row derived from the
 //                     first single-request row whose pp == 1024.
 //
@@ -125,11 +125,11 @@ private struct DeviceChip: View {
                 .font(.system(size: 10.5))
                 .foregroundStyle(theme.textTertiary)
             Text(label)
-                .font(.omlxText(11))
+                .font(.omlxText(DesignTokens.FontSize.subheadline))
                 .foregroundStyle(theme.textSecondary)
             Spacer(minLength: 0)
         }
-        .padding(.horizontal, 18)
+        .padding(.horizontal, 14)
         .padding(.top, 2)
         .padding(.bottom, 8)
     }
@@ -197,10 +197,11 @@ private struct ConfigurationSection: View {
                                  comment: "Sublabel under the Throughput Bench model picker")) {
                 Popup(
                     selection: $selectedModelId,
-                    width: 320,
+                    width: .controlWide,
                     options: modelOptions
                 )
             }
+            GPUPowerBenchNotice(model: models.first { $0.id == selectedModelId })
 
             Row(label: String(localized: "bench.throughput.row.context.label",
                               defaultValue: "Benchmark Context",
@@ -210,7 +211,7 @@ private struct ConfigurationSection: View {
                                  comment: "Sublabel under the Throughput Bench context picker")) {
                 Popup(
                     selection: $contextProfile,
-                    width: 220,
+                    width: .controlMedium,
                     options: BenchmarkContextProfile.allCases.map {
                         PopupOption(value: $0, label: $0.localizedLabel)
                     }
@@ -232,7 +233,6 @@ private struct ConfigurationSection: View {
                                      defaultValue: "Full · 2,048",
                                      comment: "Full 2048-token ANE benchmark warm-up option")),
                 ])
-                .frame(width: 260)
                 .disabled(running)
             }
 
@@ -242,24 +242,22 @@ private struct ConfigurationSection: View {
                 sublabel: String(localized: "bench.throughput.row.ane_alignment.sub",
                                  defaultValue: "Add one prompt token so PP4097 produces exactly 4,096 prefill rows. Aligned results remain local.",
                                  comment: "Explanation of the ANE-aligned throughput benchmark option")) {
-                Toggle("", isOn: $alignPromptToAne)
-                    .labelsHidden()
-                    .toggleStyle(.switch)
+                RowSwitch(isOn: $alignPromptToAne)
                     .disabled(running)
             }
 
-            FreeRow {
-                ChipRow(
-                    title: String(localized: "bench.throughput.row.context_lengths.title",
-                                  defaultValue: "Context lengths",
-                                  comment: "Inline title above the prompt-length chip row"),
-                    sublabel: String(localized: "bench.throughput.row.context_lengths.sub",
-                                     defaultValue: "Prompt tokens to feed for each single-request trial",
-                                     comment: "Sublabel under the prompt-length chip row"),
+            Row(label: String(localized: "bench.throughput.row.context_lengths.title",
+                              defaultValue: "Context lengths",
+                              comment: "Inline title above the prompt-length chip row"),
+                sublabel: String(localized: "bench.throughput.row.context_lengths.sub",
+                                 defaultValue: "Prompt tokens to feed for each single-request trial",
+                                 comment: "Sublabel under the prompt-length chip row")) {
+                ChipGroup(
                     options: Self.promptLengthOptions,
                     selection: $promptLengths,
                     format: Self.formatPromptLength
                 )
+                .disabled(running)
             }
 
             Row(label: String(localized: "bench.throughput.row.gen_length.label",
@@ -272,22 +270,22 @@ private struct ConfigurationSection: View {
                     text: $genLength,
                     placeholder: "128",
                     mono: true,
-                    width: 110
+                    width: .controlCompact
                 )
             }
 
-            FreeRow {
-                ChipRow(
-                    title: String(localized: "bench.throughput.row.batch_sizes.title",
-                                  defaultValue: "Batch sizes",
-                                  comment: "Inline title above the batch-size chip row"),
-                    sublabel: String(localized: "bench.throughput.row.batch_sizes.sub",
-                                     defaultValue: "Concurrent requests per batch in the continuous-batching phase",
-                                     comment: "Sublabel under the batch-size chip row"),
+            Row(label: String(localized: "bench.throughput.row.batch_sizes.title",
+                              defaultValue: "Batch sizes",
+                              comment: "Inline title above the batch-size chip row"),
+                sublabel: String(localized: "bench.throughput.row.batch_sizes.sub",
+                                 defaultValue: "Concurrent requests per batch in the continuous-batching phase",
+                                 comment: "Sublabel under the batch-size chip row")) {
+                ChipGroup(
                     options: Self.batchSizeOptions,
                     selection: $batchSizes,
                     format: { "\($0)" }
                 )
+                .disabled(running)
             }
 
             Row(isLast: true) {
@@ -323,7 +321,7 @@ private struct ConfigurationSection: View {
                     Text(String(localized: "bench.throughput.config.pending_flags",
                                 defaultValue: "This run will be tagged on the leaderboard: \(pendingFlags.joined(separator: ", "))",
                                 comment: "Inline note warning that acceleration features are on; placeholder is the comma-joined feature list"))
-                        .font(.omlxText(11))
+                        .font(.omlxText(DesignTokens.FontSize.subheadline))
                         .foregroundStyle(theme.textTertiary)
                         .fixedSize(horizontal: false, vertical: true)
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -357,36 +355,24 @@ private struct ConfigurationSection: View {
     }
 }
 
-// MARK: - Chip row
+// MARK: - Chip group
 
-private struct ChipRow: View {
-    let title: String
-    let sublabel: String
+/// Multi-select strip of toggle chips, used as a `Row` trailing. Styled to
+/// echo the segmented control — quiet fill, accent when selected — but with
+/// detached segments and gaps because multiple values can be active at once.
+private struct ChipGroup: View {
     let options: [Int]
     @Binding var selection: Set<Int>
     let format: (Int) -> String
 
-    @Environment(\.omlxTheme) private var theme
-
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                    .font(.omlxText(13, weight: .medium))
-                    .foregroundStyle(theme.text)
-                Text(sublabel)
-                    .font(.omlxText(11.5))
-                    .foregroundStyle(theme.textSecondary)
-            }
-            HStack(spacing: 6) {
-                ForEach(options, id: \.self) { value in
-                    Chip(
-                        label: format(value),
-                        isSelected: selection.contains(value),
-                        onTap: { toggle(value) }
-                    )
-                }
-                Spacer(minLength: 0)
+        HStack(spacing: 5) {
+            ForEach(options, id: \.self) { value in
+                Chip(
+                    label: format(value),
+                    isSelected: selection.contains(value),
+                    onTap: { toggle(value) }
+                )
             }
         }
     }
@@ -411,19 +397,16 @@ private struct Chip: View {
         Button(action: onTap) {
             Text(label)
                 .font(.omlxText(11.5, weight: .medium))
-                .foregroundStyle(isSelected ? theme.accentText : theme.textSecondary)
+                // Chips must never compress: under width pressure SwiftUI
+                // would otherwise wrap "128K" to "12/8K". The label column
+                // absorbs the squeeze instead.
+                .fixedSize()
+                .foregroundStyle(isSelected ? theme.accentText : theme.text)
                 .padding(.horizontal, 10)
                 .padding(.vertical, 4)
                 .background(
                     RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        .fill(isSelected ? theme.accent : theme.controlBg)
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 6, style: .continuous)
-                                .strokeBorder(
-                                    isSelected ? Color.clear : theme.inputBorder,
-                                    lineWidth: 0.5
-                                )
-                        )
+                        .fill(isSelected ? theme.accent : theme.hoverBg)
                 )
                 .contentShape(Rectangle())
         }
@@ -448,13 +431,13 @@ private struct LiveProgressCard: View {
                         Text(String(localized: "bench.throughput.progress.warming_up",
                                     defaultValue: "Warming up…",
                                     comment: "Throughput Bench progress label before the first result arrives"))
-                            .font(.omlxText(12))
+                            .font(.omlxText(DesignTokens.FontSize.callout))
                             .foregroundStyle(theme.textSecondary)
                     } else {
                         Text(String(localized: "bench.throughput.progress.running",
                                     defaultValue: "Running… results so far: \(resultCount)",
                                     comment: "Throughput Bench progress label with how many results have arrived; placeholder is the count"))
-                            .font(.omlxText(12))
+                            .font(.omlxText(DesignTokens.FontSize.callout))
                             .foregroundStyle(theme.textSecondary)
                     }
                     Spacer(minLength: 0)
@@ -484,10 +467,10 @@ private struct SingleResultsTable: View {
                defaultValue: "TPOT (ms)",
                comment: "Single-request results column header: time-per-output-token in ms"),
         String(localized: "bench.throughput.single.col.pp_tps",
-               defaultValue: "pp TPS",
+               defaultValue: "PP TPS",
                comment: "Single-request results column header: prompt-processing tokens-per-second"),
         String(localized: "bench.throughput.single.col.tg_tps",
-               defaultValue: "tg TPS",
+               defaultValue: "TG TPS",
                comment: "Single-request results column header: token-generation tokens-per-second"),
         String(localized: "bench.throughput.single.col.e2e",
                defaultValue: "E2E (s)",
@@ -552,7 +535,7 @@ private struct SingleResultsTable: View {
         let pp = r.pp ?? 0
         let tg = r.tg ?? 0
         return String(localized: "bench.throughput.single.test_label",
-                      defaultValue: "pp \(pp) / tg \(tg)",
+                      defaultValue: "PP \(pp) / TG \(tg)",
                       comment: "Single-request row identifier showing prompt-processing and token-generation counts; placeholders are pp and tg integer counts")
     }
 }
@@ -570,10 +553,10 @@ private struct BatchResultsTable: View {
                defaultValue: "Batch",
                comment: "Batch results column header: batch size"),
         String(localized: "bench.throughput.batch.col.tg_tps",
-               defaultValue: "tg TPS",
+               defaultValue: "TG TPS",
                comment: "Batch results column header: token-generation tokens-per-second"),
         String(localized: "bench.throughput.batch.col.pp_tps",
-               defaultValue: "pp TPS",
+               defaultValue: "PP TPS",
                comment: "Batch results column header: prompt-processing tokens-per-second"),
         String(localized: "bench.throughput.batch.col.avg_ttft",
                defaultValue: "avg TTFT (ms)",
@@ -676,7 +659,7 @@ private struct TextExportSection: View {
                         Text(String(localized: "bench.throughput.text_export.title",
                                     defaultValue: "Text export",
                                     comment: "Disclosure header for the Throughput Bench text export block"))
-                            .font(.omlxText(11, weight: .semibold))
+                            .font(.omlxText(DesignTokens.FontSize.subheadline, weight: .semibold))
                             .foregroundStyle(theme.textSecondary)
                             .textCase(.uppercase)
                             .kerning(0.6)
@@ -703,7 +686,7 @@ private struct TextExportSection: View {
                     FreeRow(isLast: true) {
                         ScrollView(.horizontal, showsIndicators: true) {
                             Text(text)
-                                .font(.omlxMono(11))
+                                .font(.omlxMono(DesignTokens.FontSize.subheadline))
                                 .foregroundStyle(theme.text)
                                 .fixedSize(horizontal: true, vertical: true)
                                 .textSelection(.enabled)
@@ -765,7 +748,7 @@ private struct UploadSection: View {
                             Text(String(localized: "bench.throughput.upload.count_submitted",
                                         defaultValue: "\(state.results.count) submitted",
                                         comment: "Inline counter shown during community upload; placeholder is the submitted count"))
-                                .font(.omlxMono(11))
+                                .font(.omlxMono(DesignTokens.FontSize.subheadline))
                                 .foregroundStyle(theme.textTertiary)
                         }
                     }
@@ -830,9 +813,9 @@ private struct UploadRow: View {
     var body: some View {
         HStack(spacing: 10) {
             Text(String(localized: "bench.throughput.upload.row.context_length",
-                        defaultValue: "pp \(result.contextLength)",
+                        defaultValue: "PP \(result.contextLength)",
                         comment: "Per-row label showing prompt-processing context length in the upload list; placeholder is the integer length"))
-                .font(.omlxMono(12))
+                .font(.omlxMono(DesignTokens.FontSize.callout))
                 .foregroundStyle(theme.text)
                 .frame(width: 80, alignment: .leading)
 
@@ -841,7 +824,7 @@ private struct UploadRow: View {
                     .font(.system(size: 11))
                     .foregroundStyle(theme.redDot)
                 Text(err)
-                    .font(.omlxText(11))
+                    .font(.omlxText(DesignTokens.FontSize.subheadline))
                     .foregroundStyle(theme.redDot)
                     .lineLimit(1)
                     .truncationMode(.tail)
@@ -859,7 +842,7 @@ private struct UploadRow: View {
                      : String(localized: "bench.throughput.upload.row.submitted",
                               defaultValue: "Submitted",
                               comment: "Upload row label after a successful submission"))
-                    .font(.omlxText(11))
+                    .font(.omlxText(DesignTokens.FontSize.subheadline))
                     .foregroundStyle(theme.textSecondary)
                 Spacer(minLength: 0)
                 Button {
@@ -879,7 +862,7 @@ private struct UploadRow: View {
                 Text(String(localized: "bench.throughput.upload.row.no_url",
                             defaultValue: "No URL returned",
                             comment: "Upload row label when the server returned no leaderboard URL"))
-                    .font(.omlxText(11))
+                    .font(.omlxText(DesignTokens.FontSize.subheadline))
                     .foregroundStyle(theme.textTertiary)
                 Spacer(minLength: 0)
             }
@@ -902,10 +885,10 @@ private struct OwnerHashRow: View {
             Text(String(localized: "bench.throughput.upload.owner_hash.label",
                         defaultValue: "Owner hash",
                         comment: "Label next to the leaderboard owner-hash identifier"))
-                .font(.omlxText(11))
+                .font(.omlxText(DesignTokens.FontSize.subheadline))
                 .foregroundStyle(theme.textTertiary)
             Text(ownerHash)
-                .font(.omlxMono(11))
+                .font(.omlxMono(DesignTokens.FontSize.subheadline))
                 .foregroundStyle(theme.textSecondary)
                 .textSelection(.enabled)
             Spacer(minLength: 0)
@@ -917,7 +900,7 @@ private struct OwnerHashRow: View {
             }
             .buttonStyle(.omlx(.plain, size: .small))
         }
-        .padding(.horizontal, 18)
+        .padding(.horizontal, 14)
         .padding(.top, 4)
         .padding(.bottom, 10)
     }
@@ -941,10 +924,10 @@ private struct SkippedBanner: View {
                 Text(String(localized: "bench.throughput.upload.skipped.title",
                             defaultValue: "Skipped community upload",
                             comment: "Banner heading shown when the server skipped uploading bench results"))
-                    .font(.omlxText(12, weight: .semibold))
+                    .font(.omlxText(DesignTokens.FontSize.callout, weight: .semibold))
                     .foregroundStyle(theme.text)
                 Text(body(reason: reason))
-                    .font(.omlxText(11))
+                    .font(.omlxText(DesignTokens.FontSize.subheadline))
                     .foregroundStyle(theme.textSecondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -985,7 +968,7 @@ private struct FeatureFlagChips: View {
                 Text(String(localized: "bench.throughput.upload.flags.title",
                             defaultValue: "Acceleration flags",
                             comment: "Heading above the acceleration-feature chips in the community upload block"))
-                    .font(.omlxText(11))
+                    .font(.omlxText(DesignTokens.FontSize.subheadline))
                     .foregroundStyle(theme.textTertiary)
                 FlowRow(spacing: 6) {
                     ForEach(flags) { flag in
